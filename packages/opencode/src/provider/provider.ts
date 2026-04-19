@@ -31,6 +31,14 @@ import { ModelID, ProviderID } from "./schema"
 
 const log = Log.create({ service: "provider" })
 
+export class SSEStallError extends Error {
+  readonly _tag = "SSEStallError"
+  constructor(message: string) {
+    super(message)
+    this.name = "SSEStallError"
+  }
+}
+
 function shouldUseCopilotResponsesApi(modelID: string): boolean {
   const match = /^gpt-(\d+)/.exec(modelID)
   if (!match) return false

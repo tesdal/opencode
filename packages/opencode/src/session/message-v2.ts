@@ -56,6 +56,11 @@ export const APIError = NamedError.create(
   }),
 )
 export type APIError = z.infer<typeof APIError.Schema>
+export const SSEStallError = NamedError.create(
+  "SSEStallError",
+  z.object({ message: z.string() }),
+)
+export type SSEStallError = z.infer<typeof SSEStallError.Schema>
 export const ContextOverflowError = NamedError.create(
   "ContextOverflowError",
   z.object({ message: z.string(), responseBody: z.string().optional() }),
@@ -415,6 +420,7 @@ export const Assistant = Base.extend({
       StructuredOutputError.Schema,
       ContextOverflowError.Schema,
       APIError.Schema,
+      SSEStallError.Schema,
     ])
     .optional(),
   parentID: MessageID.zod,
@@ -938,6 +944,16 @@ export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: Ses
   return filterCompacted(stream(sessionID))
 })
 
+function hasSSEStallCause(e: unknown, depth = 0): boolean {
+  if (depth > 8) return false
+  if (!e || typeof e !== "object") return false
+  const err = e as { name?: string; _tag?: string; message?: string; cause?: unknown }
+  if (err.name === "SSEStallError" || err._tag === "SSEStallError") return true
+  if (typeof err.message === "string" && err.message.includes("SSE chunk timeout")) return true
+  if (err.cause) return hasSSEStallCause(err.cause, depth + 1)
+  return false
+}
+
 export function fromError(
   e: unknown,
   ctx: { providerID: ProviderID; aborted?: boolean },
@@ -987,6 +1003,11 @@ export function fromError(
           },
         },
         { cause: e },
+      ).toObject()
+    case hasSSEStallCause(e):
+      return new SSEStallError(
+        { message: e instanceof Error ? e.message : String(e) },
+        { cause: e instanceof Error ? e : undefined },
       ).toObject()
     case APICallError.isInstance(e):
       const parsed = ProviderError.parseAPICallError({
