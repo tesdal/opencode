@@ -13,9 +13,20 @@ export const RETRY_INITIAL_DELAY = 2000
 export const RETRY_BACKOFF_FACTOR = 2
 export const RETRY_MAX_DELAY_NO_HEADERS = 30_000 // 30 seconds
 export const RETRY_MAX_DELAY = 2_147_483_647 // max 32-bit signed integer for setTimeout
+export const TRANSPORT_RETRY_CAP = 5
+
+const TRANSPORT_PATTERNS = ["ETIMEDOUT", "ECONNRESET", "ECONNREFUSED", "EAI_AGAIN", "socket hang up"]
 
 function cap(ms: number) {
   return Math.min(ms, RETRY_MAX_DELAY)
+}
+
+function transportMessage(error: Err) {
+  if (MessageV2.SSEStallError.isInstance(error)) return error.data.message
+  const msg = error.data?.message
+  if (typeof msg !== "string") return undefined
+  if (!TRANSPORT_PATTERNS.some((pattern) => msg.includes(pattern))) return undefined
+  return msg
 }
 
 export function delay(attempt: number, error?: MessageV2.APIError) {
@@ -76,6 +87,9 @@ export function retryable(error: Err) {
     }
   }
 
+  const transport = transportMessage(error)
+  if (transport) return transport
+
   const json = iife(() => {
     try {
       if (typeof error.data?.message === "string") {
@@ -111,7 +125,11 @@ export function policy(opts: {
     Effect.succeed((meta: Schedule.InputMetadata<unknown>) => {
       const error = opts.parse(meta.input)
       const message = retryable(error)
-      if (!message) return Cause.done(meta.attempt)
+      const transport = transportMessage(error)
+      if (!message) return Effect.failCause(Cause.Done(meta.attempt) as unknown as Cause.Cause<number>)
+      if (transport && !MessageV2.APIError.isInstance(error) && meta.attempt > TRANSPORT_RETRY_CAP) {
+        return Effect.failCause(Cause.Done(meta.attempt) as unknown as Cause.Cause<number>)
+      }
       return Effect.gen(function* () {
         const wait = delay(meta.attempt, MessageV2.APIError.isInstance(error) ? error : undefined)
         const now = yield* Clock.currentTimeMillis
