@@ -45,7 +45,27 @@ function shouldUseCopilotResponsesApi(modelID: string): boolean {
   return Number(match[1]) >= 5 && !modelID.startsWith("gpt-5-mini")
 }
 
-function wrapSSE(res: Response, ms: number, ctl: AbortController) {
+const DEFAULT_CHUNK_TIMEOUT_MS = 120_000
+const EXTENDED_THINKING_CHUNK_TIMEOUT_MS = 600_000
+const EXTENDED_THINKING_PROVIDERS: ReadonlySet<string> = new Set([
+  "anthropic",
+  "google-vertex-anthropic",
+  "amazon-bedrock",
+])
+
+export function resolveChunkTimeout(providerID: string, value: unknown): number {
+  if (value === false) return 0
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || value <= 0) return 0
+    return value
+  }
+  if (value !== undefined) log.warn("unrecognized chunkTimeout value, using provider default", { providerID, value })
+  return EXTENDED_THINKING_PROVIDERS.has(providerID)
+    ? EXTENDED_THINKING_CHUNK_TIMEOUT_MS
+    : DEFAULT_CHUNK_TIMEOUT_MS
+}
+
+export function wrapSSE(res: Response, ms: number, ctl: AbortController) {
   if (typeof ms !== "number" || ms <= 0) return res
   if (!res.body) return res
   if (!res.headers.get("content-type")?.includes("text/event-stream")) return res
@@ -1437,13 +1457,13 @@ const layer: Layer.Layer<
         if (existing) return existing
 
         const customFetch = options["fetch"]
-        const chunkTimeout = options["chunkTimeout"]
+        const resolvedChunkTimeout = resolveChunkTimeout(model.providerID, options["chunkTimeout"])
         delete options["chunkTimeout"]
 
         options["fetch"] = async (input: any, init?: BunFetchRequestInit) => {
           const fetchFn = customFetch ?? fetch
           const opts = init ?? {}
-          const chunkAbortCtl = typeof chunkTimeout === "number" && chunkTimeout > 0 ? new AbortController() : undefined
+          const chunkAbortCtl = resolvedChunkTimeout > 0 ? new AbortController() : undefined
           const signals: AbortSignal[] = []
 
           if (opts.signal) signals.push(opts.signal)
@@ -1476,7 +1496,7 @@ const layer: Layer.Layer<
           })
 
           if (!chunkAbortCtl) return res
-          return wrapSSE(res, chunkTimeout, chunkAbortCtl)
+          return wrapSSE(res, resolvedChunkTimeout, chunkAbortCtl)
         }
 
         const bundledLoader = BUNDLED_PROVIDERS[model.api.npm]
