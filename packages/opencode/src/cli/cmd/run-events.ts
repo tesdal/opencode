@@ -3,6 +3,7 @@ import { Bus } from "@/bus"
 import { Permission } from "@/permission"
 import { Question } from "@/question"
 import { Session } from "@/session"
+import { NotFoundError } from "@/storage"
 import { SessionID } from "@/session/schema"
 import { Log } from "@/util"
 
@@ -59,7 +60,10 @@ export const make = Effect.fn("RunEvents.make")(function* (config: Config) {
       depth++
       const lookup: Option.Option<Session.Info> = yield* session.get(cur).pipe(
         Effect.option,
-        Effect.catchDefect(() => Effect.succeed(Option.none<Session.Info>())),
+        Effect.catchDefect((defect) => {
+          if (!NotFoundError.isInstance(defect)) return Effect.die(defect)
+          return Effect.succeed(Option.none<Session.Info>())
+        }),
       )
       if (Option.isNone(lookup)) break
       cur = lookup.value.parentID ?? undefined

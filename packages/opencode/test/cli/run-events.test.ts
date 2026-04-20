@@ -303,25 +303,28 @@ describe("cli/run-events", () => {
           jsonMode: false,
         })
 
-        const exits = yield* Effect.all(
-          Array.from({ length: 6 }, () =>
-            Effect.exit(
-              question.ask({
-                sessionID: rootSessionID,
-                questions: [
-                  {
-                    question: "loop?",
-                    header: "h",
-                    options: [{ label: "n", description: "n" }],
-                  },
-                ],
-              }),
-            ),
-          ),
-          { concurrency: 1 },
-        )
+        const askOnce = () =>
+          Effect.exit(
+            question.ask({
+              sessionID: rootSessionID,
+              questions: [
+                {
+                  question: "loop?",
+                  header: "h",
+                  options: [{ label: "n", description: "n" }],
+                },
+              ],
+            }),
+          )
 
-        expect(exits.every(Exit.isFailure)).toBe(true)
+        const firstFiveExits = yield* Effect.all(Array.from({ length: 5 }, askOnce), {
+          concurrency: 1,
+        })
+        expect(firstFiveExits.every(Exit.isFailure)).toBe(true)
+        expect(handler.stats.livelockWarned).toBe(false)
+
+        const sixthExit = yield* askOnce()
+        expect(Exit.isFailure(sixthExit)).toBe(true)
         expect(handler.stats.autoRejectedQuestions).toBe(6)
         expect(handler.stats.livelockWarned).toBe(true)
 
