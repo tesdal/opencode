@@ -22,9 +22,8 @@ describe("session.message-v2.fromError — SSEStallError", () => {
     error.name = "SSEStallError"
 
     const result = MessageV2.fromError(error, { providerID })
-    const schema = (MessageV2 as { SSEStallError?: { isInstance: (input: unknown) => boolean } }).SSEStallError
 
-    expect(schema?.isInstance(result)).toBe(true)
+    expect(MessageV2.SSEStallError.isInstance(result)).toBe(true)
   })
 
   test("detects SSE stall by timeout message without SSEStallError name", () => {

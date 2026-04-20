@@ -944,12 +944,16 @@ export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: Ses
   return filterCompacted(stream(sessionID))
 })
 
+// Legacy substring fallback for rare paths where the tagged class gets stripped
+// during cross-realm rethrow. Primary signal is `name`/`_tag` set by SSEStallError.
+const SSE_STALL_MESSAGE_RE = /SSE (read|chunk) time(d out|out)/
+
 function hasSSEStallCause(e: unknown, depth = 0): boolean {
   if (depth > 8) return false
   if (!e || typeof e !== "object") return false
   const err = e as { name?: string; _tag?: string; message?: string; cause?: unknown }
   if (err.name === "SSEStallError" || err._tag === "SSEStallError") return true
-  if (typeof err.message === "string" && err.message.includes("SSE chunk timeout")) return true
+  if (typeof err.message === "string" && SSE_STALL_MESSAGE_RE.test(err.message)) return true
   if (err.cause) return hasSSEStallCause(err.cause, depth + 1)
   return false
 }
