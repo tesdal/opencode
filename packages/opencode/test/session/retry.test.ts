@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import type { NamedError } from "@opencode-ai/shared/util/error"
 import { APICallError } from "ai"
 import { setTimeout as sleep } from "node:timers/promises"
-import { Cause, Effect, Exit, Layer, Schedule } from "effect"
+import { Effect, Exit, Layer, Pull, Schedule } from "effect"
 import { SessionRetry } from "../../src/session/retry"
 import { MessageV2 } from "../../src/session/message-v2"
 import { SSEStallError } from "../../src/provider/provider"
@@ -307,9 +307,10 @@ describe("SessionRetry.policy — transport retry budget", () => {
         expect(setCalls).toBe(5)
         expect(terminal).toBeDefined()
         if (!Exit.isFailure(terminal!)) throw new Error("expected terminal exit to be Failure")
-        // Policy signals "stop retrying" via Cause.done(n), not Cause.fail.
-        // Cause.isDone confirms schedule completed normally, not crashed.
-        expect(Cause.isDone(terminal.cause)).toBe(true)
+        // Policy signals "stop retrying" via Cause.done(n), surfaced by Pull
+        // as a Failure whose cause contains a Done reason. Pull.isDoneCause
+        // confirms schedule completed normally (not crashed via fail/die).
+        expect(Pull.isDoneCause(terminal.cause)).toBe(true)
       }),
   )
 })

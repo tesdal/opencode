@@ -126,9 +126,9 @@ export function policy(opts: {
       const error = opts.parse(meta.input)
       const message = retryable(error)
       const transport = transportMessage(error)
-      if (!message) return Effect.failCause(Cause.Done(meta.attempt) as unknown as Cause.Cause<number>)
+      if (!message) return Cause.done(meta.attempt)
       if (transport && !MessageV2.APIError.isInstance(error) && meta.attempt > TRANSPORT_RETRY_CAP) {
-        return Effect.failCause(Cause.Done(meta.attempt) as unknown as Cause.Cause<number>)
+        return Cause.done(meta.attempt)
       }
       return Effect.gen(function* () {
         const wait = delay(meta.attempt, MessageV2.APIError.isInstance(error) ? error : undefined)
