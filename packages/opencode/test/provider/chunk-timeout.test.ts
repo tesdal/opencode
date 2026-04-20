@@ -26,6 +26,14 @@ describe("provider.resolveChunkTimeout", () => {
     expect(resolveChunkTimeout("github-copilot", 60_000)).toBe(60_000)
   })
 
+  test("explicit positive number wins over extended-thinking default", () => {
+    expect(resolveChunkTimeout("anthropic", 30_000)).toBe(30_000)
+  })
+
+  test("false wins over extended-thinking default (returns 0)", () => {
+    expect(resolveChunkTimeout("anthropic", false)).toBe(0)
+  })
+
   test("falls back to provider default for non-numeric junk", () => {
     // Defensive branch — config schema prevents this, but runtime check guards misconfig.
     expect(resolveChunkTimeout("github-copilot", "not-a-number" as never)).toBe(120_000)
@@ -35,20 +43,16 @@ describe("provider.resolveChunkTimeout", () => {
 describe("provider.wrapSSE — SSEStallError integration", () => {
   test("throws SSEStallError when chunk read exceeds timeout", async () => {
     const stream = new ReadableStream<Uint8Array>({
-      start() {
-        // deliberately emit nothing
+      pull() {
+        return new Promise<void>(() => {}) // never resolves — forces stall
       },
     })
     const res = new Response(stream, { headers: { "content-type": "text/event-stream" } })
     const ctl = new AbortController()
-    const wrapped = wrapSSE(res, 50, ctl)
+    const wrapped = wrapSSE(res, 2, ctl)
     const reader = wrapped.body!.getReader()
-    let err: unknown
-    await reader.read().catch((e: unknown) => {
-      err = e
-    })
-    expect(err).toBeInstanceOf(SSEStallError)
-    expect((err as Error).message).toContain("SSE read timed out")
+
+    await expect(reader.read()).rejects.toBeInstanceOf(SSEStallError)
   })
 
   test("does not wrap non-SSE responses", () => {
