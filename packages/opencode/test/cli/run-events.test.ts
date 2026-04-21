@@ -8,7 +8,7 @@ import { Permission } from "../../src/permission"
 import { Session } from "../../src/session"
 import { Bus } from "../../src/bus"
 import { SessionID } from "../../src/session/schema"
-import { RunEvents } from "../../src/cli/cmd/run-events"
+import { MAX_LINEAGE_DEPTH, RunEvents } from "../../src/cli/cmd/run-events"
 
 const it = testEffect(
   Layer.mergeAll(
@@ -31,6 +31,19 @@ const waitForQuestionCount = (
       yield* Effect.sleep("10 millis")
     }
     return yield* Effect.fail(new Error(`timed out waiting for ${count} question(s)`))
+  })
+
+const waitForPermissionCount = (
+  permission: Permission.Interface,
+  count: number,
+): Effect.Effect<ReadonlyArray<Permission.Request>, Error> =>
+  Effect.gen(function* () {
+    for (const _ of Array.from({ length: 100 })) {
+      const pending = yield* permission.list()
+      if (pending.length === count) return pending
+      yield* Effect.sleep("10 millis")
+    }
+    return yield* Effect.fail(new Error(`timed out waiting for ${count} permission(s)`))
   })
 
 describe("cli/run-events", () => {
@@ -102,6 +115,62 @@ describe("cli/run-events", () => {
     ),
   )
 
+  it.live("auto-rejects question.asked across a grandchild lineage walk", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const question = yield* Question.Service
+        const session = yield* Session.Service
+        const rootSessionID = SessionID.make("ses_root_grandchild_0000000000000")
+        const middle = yield* session.create({ parentID: rootSessionID, title: "Middle" })
+        const child = yield* session.create({ parentID: middle.id, title: "Grandchild" })
+        const handler = yield* RunEvents.make({
+          rootSessionID,
+          skipPermissions: false,
+          jsonMode: false,
+        })
+
+        const childResult = yield* Effect.exit(
+          question.ask({
+            sessionID: child.id,
+            questions: [
+              {
+                question: "first?",
+                header: "h",
+                options: [{ label: "a", description: "a" }],
+              },
+            ],
+          }),
+        )
+
+        expect(Exit.isFailure(childResult)).toBe(true)
+        if (Exit.isFailure(childResult)) {
+          expect(Cause.squash(childResult.cause)).toBeInstanceOf(Question.RejectedError)
+        }
+
+        const middleResult = yield* Effect.exit(
+          question.ask({
+            sessionID: middle.id,
+            questions: [
+              {
+                question: "second?",
+                header: "h",
+                options: [{ label: "b", description: "b" }],
+              },
+            ],
+          }),
+        )
+
+        expect(Exit.isFailure(middleResult)).toBe(true)
+        if (Exit.isFailure(middleResult)) {
+          expect(Cause.squash(middleResult.cause)).toBeInstanceOf(Question.RejectedError)
+        }
+        expect(handler.stats.autoRejectedQuestions).toBe(2)
+
+        yield* Effect.sync(() => handler.unsubscribe())
+      }),
+    ),
+  )
+
   it.live("ignores question.asked for an unrelated session tree", () =>
     provideTmpdirInstance(() =>
       Effect.gen(function* () {
@@ -131,6 +200,53 @@ describe("cli/run-events", () => {
 
         expect(handler.stats.autoRejectedQuestions).toBe(0)
         expect(pending[0].sessionID).toBe(unrelatedSessionID)
+
+        yield* question.reject(pending[0].id)
+        const exit = yield* Fiber.await(fiber)
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(Question.RejectedError)
+
+        yield* Effect.sync(() => handler.unsubscribe())
+      }),
+    ),
+  )
+
+  it.live("does not auto-reject when lineage depth exceeds MAX_LINEAGE_DEPTH", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const question = yield* Question.Service
+        const session = yield* Session.Service
+        const rootSessionID = SessionID.make("ses_root_depth_cutoff_000000000000")
+        const handler = yield* RunEvents.make({
+          rootSessionID,
+          skipPermissions: false,
+          jsonMode: false,
+        })
+
+        const createDeepChild = (parentID: SessionID, remaining: number): Effect.Effect<SessionID> => {
+          if (remaining === 0) return Effect.succeed(parentID)
+          return session
+            .create({ parentID, title: "Depth child" })
+            .pipe(Effect.flatMap((created) => createDeepChild(created.id, remaining - 1)))
+        }
+
+        const deepSessionID = yield* createDeepChild(rootSessionID, MAX_LINEAGE_DEPTH + 1)
+        const fiber = yield* question
+          .ask({
+            sessionID: deepSessionID,
+            questions: [
+              {
+                question: "deep?",
+                header: "h",
+                options: [{ label: "n", description: "n" }],
+              },
+            ],
+          })
+          .pipe(Effect.forkScoped)
+
+        const pending = yield* waitForQuestionCount(question, 1)
+        expect(pending[0].sessionID).toBe(deepSessionID)
+        expect(handler.stats.autoRejectedQuestions).toBe(0)
 
         yield* question.reject(pending[0].id)
         const exit = yield* Fiber.await(fiber)
@@ -225,6 +341,109 @@ describe("cli/run-events", () => {
         expect(yield* permission.list()).toHaveLength(0)
 
         yield* Effect.sync(() => handler.unsubscribe())
+      }),
+    ),
+  )
+
+  it.live("does not cache unrelated walks as descendants for permission.asked", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const permission = yield* Permission.Service
+        const session = yield* Session.Service
+        const rootSessionID = SessionID.make("ses_root_cache_guard_0000000000000")
+        const unrelatedRootSessionID = SessionID.make("ses_unrelated_root_000000000000")
+        const x = yield* session.create({ parentID: unrelatedRootSessionID, title: "X" })
+        const y = yield* session.create({ parentID: x.id, title: "Y" })
+        const handler = yield* RunEvents.make({
+          rootSessionID,
+          skipPermissions: false,
+          jsonMode: false,
+        })
+
+        const askPermission = (sessionID: SessionID) =>
+          permission.ask({
+            sessionID,
+            permission: "bash",
+            patterns: ["ls"],
+            metadata: {},
+            always: [],
+            ruleset: [{ permission: "bash", pattern: "*", action: "ask" }],
+          })
+
+        const yFiber = yield* askPermission(y.id).pipe(Effect.forkScoped)
+        const firstPending = yield* waitForPermissionCount(permission, 1)
+        expect(firstPending[0].sessionID).toBe(y.id)
+        expect(handler.stats.autoRejectedPermissions).toBe(0)
+        yield* permission.reply({ requestID: firstPending[0].id, reply: "once" })
+        const yExit = yield* Fiber.await(yFiber)
+        expect(Exit.isSuccess(yExit)).toBe(true)
+
+        const xFiber = yield* askPermission(x.id).pipe(Effect.forkScoped)
+        const secondPending = yield* waitForPermissionCount(permission, 1)
+        expect(secondPending[0].sessionID).toBe(x.id)
+        expect(handler.stats.autoRejectedPermissions).toBe(0)
+        yield* permission.reply({ requestID: secondPending[0].id, reply: "once" })
+        const xExit = yield* Fiber.await(xFiber)
+        expect(Exit.isSuccess(xExit)).toBe(true)
+
+        const descendant = yield* session.create({ parentID: rootSessionID, title: "Descendant" })
+        const descendantExit = yield* Effect.exit(askPermission(descendant.id))
+        expect(Exit.isFailure(descendantExit)).toBe(true)
+        if (Exit.isFailure(descendantExit)) {
+          expect(Cause.squash(descendantExit.cause)).toBeInstanceOf(Permission.RejectedError)
+        }
+        expect(handler.stats.autoRejectedPermissions).toBe(1)
+
+        yield* Effect.sync(() => handler.unsubscribe())
+      }),
+    ),
+  )
+
+  it.live("auto-approves permission.asked for the root when skipPermissions=true", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const permission = yield* Permission.Service
+        const bus = yield* Bus.Service
+        const rootSessionID = SessionID.make("ses_root_skip_perm_root_000000000")
+        const replies: Array<{ sessionID: SessionID; reply: string }> = []
+        const unsubscribeReply = yield* bus.subscribeCallback(Permission.Event.Replied, (evt) => {
+          replies.push({ sessionID: evt.properties.sessionID, reply: evt.properties.reply })
+        })
+        const handler = yield* RunEvents.make({
+          rootSessionID,
+          skipPermissions: true,
+          jsonMode: false,
+        })
+
+        const exit = yield* Effect.exit(
+          permission.ask({
+            sessionID: rootSessionID,
+            permission: "bash",
+            patterns: ["ls"],
+            metadata: {},
+            always: [],
+            ruleset: [{ permission: "bash", pattern: "*", action: "ask" }],
+          }),
+        )
+
+        yield* Effect.gen(function* () {
+          for (const _ of Array.from({ length: 100 })) {
+            if (replies.length === 1) return
+            yield* Effect.sleep("10 millis")
+          }
+          return yield* Effect.fail(new Error("timed out waiting for permission.replied event"))
+        })
+
+        expect(Exit.isSuccess(exit)).toBe(true)
+        expect(handler.stats.autoRejectedPermissions).toBe(0)
+        expect(replies[0]?.sessionID).toBe(rootSessionID)
+        expect(replies[0]?.reply).toBe("once")
+        expect(yield* permission.list()).toHaveLength(0)
+
+        yield* Effect.sync(() => {
+          unsubscribeReply()
+          handler.unsubscribe()
+        })
       }),
     ),
   )
