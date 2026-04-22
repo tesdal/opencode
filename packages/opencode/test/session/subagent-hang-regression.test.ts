@@ -250,20 +250,23 @@ it.live(
         // Bounded wait for the retry transition. Budget covers: first
         // setup pass (cold provider state, models.dev load), one chunk
         // timeout (1s), plus schedule classification. If the fiber never
-        // transitions to retry, the hang regression is back.
-        const observed = yield* Effect.promise(async () => {
+        // transitions to retry, the hang regression is back. `pollUnsafe` is
+        // the public synchronous-peek API — we use it to short-circuit if
+        // the fiber dies early so the error cause surfaces, rather than
+        // timing out blindly at 8s.
+        const observed = yield* Effect.gen(function* () {
           const end = Date.now() + 8_000
           while (Date.now() < end) {
             const exit = fiber.pollUnsafe()
-            if (exit) {
-              throw new Error(`loop exited before retry observed: ${JSON.stringify(exit)}`)
-            }
-            const snap = await Effect.runPromise(sessionStatus.get(chat.id))
+            if (exit) return yield* Effect.fail(new Error(`loop exited before retry observed: ${JSON.stringify(exit)}`))
+            const snap = yield* sessionStatus.get(chat.id)
             if (snap.type === "retry") return snap
-            await new Promise((done) => setTimeout(done, 25))
+            yield* Effect.sleep("25 millis")
           }
-          const snap = await Effect.runPromise(sessionStatus.get(chat.id))
-          throw new Error(`expected retry status within 8s; last status: ${JSON.stringify(snap)}`)
+          const snap = yield* sessionStatus.get(chat.id)
+          return yield* Effect.fail(
+            new Error(`expected retry status within 8s; last status: ${JSON.stringify(snap)}`),
+          )
         })
 
         expect(observed.type).toBe("retry")
