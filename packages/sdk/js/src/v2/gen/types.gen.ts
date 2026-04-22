@@ -215,6 +215,13 @@ export type ApiError = {
   }
 }
 
+export type SseStallError = {
+  name: "SSEStallError"
+  data: {
+    message: string
+  }
+}
+
 export type EventSessionError = {
   type: "session.error"
   properties: {
@@ -227,6 +234,7 @@ export type EventSessionError = {
       | StructuredOutputError
       | ContextOverflowError
       | ApiError
+      | SseStallError
   }
 }
 
@@ -595,6 +603,7 @@ export type AssistantMessage = {
     | StructuredOutputError
     | ContextOverflowError
     | ApiError
+    | SseStallError
   parentID: string
   modelID: string
   providerID: string
@@ -1318,10 +1327,10 @@ export type ProviderConfig = {
      */
     timeout?: number | false
     /**
-     * Timeout in milliseconds between streamed SSE chunks for this provider. If no chunk arrives within this window, the request is aborted.
+     * Timeout in milliseconds between streamed SSE chunks for this provider. If no chunk arrives within this window, the request is aborted. Defaults to 120000 (120s) for most providers, 600000 (10min) for Anthropic-family providers (to accommodate extended thinking). Set to false to disable.
      */
-    chunkTimeout?: number
-    [key: string]: unknown | string | boolean | number | false | number | undefined
+    chunkTimeout?: number | false
+    [key: string]: unknown | string | boolean | number | false | number | false | undefined
   }
   models?: {
     [key: string]: {

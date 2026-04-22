@@ -2,15 +2,17 @@ import { describe, expect, test } from "bun:test"
 import type { NamedError } from "@opencode-ai/shared/util/error"
 import { APICallError } from "ai"
 import { setTimeout as sleep } from "node:timers/promises"
-import { Effect, Schedule } from "effect"
+import { Effect, Exit, Layer, Pull, Schedule } from "effect"
 import { SessionRetry } from "../../src/session/retry"
 import { MessageV2 } from "../../src/session/message-v2"
+import { SSEStallError } from "../../src/provider/provider"
 import { ProviderID } from "../../src/provider/schema"
 import { AppRuntime } from "../../src/effect/app-runtime"
 import { SessionID } from "../../src/session/schema"
 import { SessionStatus } from "../../src/session/status"
 import { Instance } from "../../src/project/instance"
 import { tmpdir } from "../fixture/fixture"
+import { testEffect } from "../lib/effect"
 
 const providerID = ProviderID.make("test")
 
@@ -230,6 +232,87 @@ describe("session.retry.retryable", () => {
     expect(retryable).toBeDefined()
     expect(retryable).toBe("Response decompression failed")
   })
+})
+
+describe("SessionRetry.retryable — SSE stall round-trip", () => {
+  test("retries SSEStallError after MessageV2.fromError round-trip", () => {
+    const err = new SSEStallError("SSE read timed out")
+    const obj = MessageV2.fromError(err, { providerID })
+    expect(MessageV2.SSEStallError.isInstance(obj)).toBe(true)
+    expect(SessionRetry.retryable(obj)).toBe("SSE read timed out")
+  })
+})
+
+describe("SessionRetry.retryable — narrow transport substrings", () => {
+  test("retries ETIMEDOUT", () => {
+    expect(SessionRetry.retryable(wrap("connect ETIMEDOUT 140.82.114.6:443"))).toContain("ETIMEDOUT")
+  })
+
+  test("retries ECONNRESET", () => {
+    expect(SessionRetry.retryable(wrap("read ECONNRESET"))).toContain("ECONNRESET")
+  })
+
+  test("retries ECONNREFUSED", () => {
+    expect(SessionRetry.retryable(wrap("connect ECONNREFUSED 127.0.0.1"))).toContain("ECONNREFUSED")
+  })
+
+  test("retries EAI_AGAIN", () => {
+    expect(SessionRetry.retryable(wrap("getaddrinfo EAI_AGAIN api.example.com"))).toContain("EAI_AGAIN")
+  })
+
+  test("retries socket hang up", () => {
+    expect(SessionRetry.retryable(wrap("socket hang up"))).toContain("socket hang up")
+  })
+
+  test("does NOT retry EPIPE (often user-initiated abort)", () => {
+    expect(SessionRetry.retryable(wrap("write EPIPE"))).toBeUndefined()
+  })
+
+  test("does NOT retry the phrase 'network error' broadly", () => {
+    expect(SessionRetry.retryable(wrap("upstream returned a network error"))).toBeUndefined()
+  })
+
+  test("does NOT retry arbitrary agent errors", () => {
+    expect(SessionRetry.retryable(wrap("agent not found: explore"))).toBeUndefined()
+  })
+})
+
+describe("SessionRetry.policy — transport retry budget", () => {
+  const it = testEffect(Layer.empty)
+
+  it.live(
+    "stops after exactly 6 total attempts on transport error (TRANSPORT_RETRY_CAP=5 + initial)",
+    () =>
+      Effect.gen(function* () {
+        let setCalls = 0
+        const step = yield* Schedule.toStep(
+          SessionRetry.policy({
+            parse: (err) => err as ReturnType<NamedError["toObject"]>,
+            set: (_info) =>
+              Effect.sync(() => {
+                setCalls++
+              }),
+          }),
+        )
+        const now = 0
+        let terminal: Exit.Exit<unknown, unknown> | undefined
+        for (let i = 0; i < 10; i++) {
+          const exit = yield* Effect.exit(step(now, wrap("connect ETIMEDOUT 1.2.3.4")))
+          if (!Exit.isSuccess(exit)) {
+            terminal = exit
+            break
+          }
+        }
+        // 5 delay/set invocations for retries, then the 6th call returns Cause.done(6)
+        expect(setCalls).toBe(5)
+        expect(terminal).toBeDefined()
+        if (!Exit.isFailure(terminal!)) throw new Error("expected terminal exit to be Failure")
+        // Policy signals "stop retrying" via Cause.done(n), surfaced by Pull
+        // as a Failure whose cause contains a Done reason. Pull.isDoneCause
+        // confirms schedule completed normally (not crashed via fail/die).
+        expect(Pull.isDoneCause(terminal.cause)).toBe(true)
+      }),
+  )
 })
 
 describe("session.message-v2.fromError", () => {
