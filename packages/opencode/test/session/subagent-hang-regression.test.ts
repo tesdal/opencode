@@ -335,26 +335,30 @@ it.live(
         // reject indiscriminately — the production handler does parent-chain
         // lineage checks which are orthogonal to the hang contract.
         let questionsRejected = 0
-        const unsubQuestion = yield* bus.subscribeCallback(Question.Event.Asked, (event) =>
-          Effect.runPromise(
-            Effect.gen(function* () {
-              questionsRejected += 1
-              yield* question.reject(event.properties.id)
-            }),
-          ),
-        )
-        const unsubPermission = yield* bus.subscribeCallback(Permission.Event.Asked, (event) =>
-          Effect.runPromise(
-            Effect.gen(function* () {
-              yield* permission.reply({ requestID: event.properties.id, reply: "reject" })
-            }),
-          ),
-        )
-        yield* Effect.addFinalizer(() =>
-          Effect.sync(() => {
-            unsubQuestion()
-            unsubPermission()
+        yield* Effect.acquireRelease(
+          Effect.gen(function* () {
+            const unsubQuestion = yield* bus.subscribeCallback(Question.Event.Asked, (event) =>
+              Effect.runPromise(
+                Effect.gen(function* () {
+                  questionsRejected += 1
+                  yield* question.reject(event.properties.id)
+                }),
+              ),
+            )
+            const unsubPermission = yield* bus.subscribeCallback(Permission.Event.Asked, (event) =>
+              Effect.runPromise(
+                Effect.gen(function* () {
+                  yield* permission.reply({ requestID: event.properties.id, reply: "reject" })
+                }),
+              ),
+            )
+            return { unsubQuestion, unsubPermission }
           }),
+          (handles) =>
+            Effect.sync(() => {
+              handles.unsubQuestion()
+              handles.unsubPermission()
+            }),
         )
 
         const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
