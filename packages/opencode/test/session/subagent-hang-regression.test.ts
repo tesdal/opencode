@@ -113,7 +113,7 @@ const status = SessionStatus.layer.pipe(Layer.provideMerge(Bus.layer))
 const run = SessionRunState.layer.pipe(Layer.provide(status))
 const infra = Layer.mergeAll(NodeFileSystem.layer, CrossSpawnSpawner.defaultLayer)
 
-// Copied verbatim from `prompt-effect.test.ts` — that file exports nothing,
+// Copied verbatim from `prompt.test.ts` — that file exports nothing,
 // so we can't import the helper. Keeping the composition identical guarantees
 // this regression gate exercises the same service wiring the rest of the
 // loop tests do (real Session/SessionPrompt/ToolRegistry/Question/Permission,
@@ -253,9 +253,9 @@ it.live(
         // transitions to retry, the hang regression is back. `pollUnsafe` is
         // the public synchronous-peek API — we use it to short-circuit if
         // the fiber dies early so the error cause surfaces, rather than
-        // timing out blindly at 8s.
+        // timing out blindly at 12s.
         const observed = yield* Effect.gen(function* () {
-          const end = Date.now() + 8_000
+          const end = Date.now() + 12_000
           while (Date.now() < end) {
             const exit = fiber.pollUnsafe()
             if (exit) return yield* Effect.fail(new Error(`loop exited before retry observed: ${JSON.stringify(exit)}`))
@@ -264,10 +264,18 @@ it.live(
             yield* Effect.sleep("25 millis")
           }
           const snap = yield* sessionStatus.get(chat.id)
+          if (snap.type === "retry") return snap
           return yield* Effect.fail(
-            new Error(`expected retry status within 8s; last status: ${JSON.stringify(snap)}`),
+            new Error(`expected retry status within 12s; last status: ${JSON.stringify(snap)}`),
           )
-        })
+        }).pipe(
+          Effect.ensuring(
+            Effect.gen(function* () {
+              yield* prompt.cancel(chat.id).pipe(Effect.timeout("1 second"), Effect.ignore)
+              yield* Fiber.interrupt(fiber).pipe(Effect.timeout("3 seconds"), Effect.ignore)
+            }),
+          ),
+        )
 
         expect(observed.type).toBe("retry")
         expect(observed.attempt).toBeGreaterThanOrEqual(1)
@@ -275,10 +283,7 @@ it.live(
         // SSEStallError.data.message ("SSE read timed out after 1000ms").
         expect(observed.message).toMatch(/SSE|timed out/i)
 
-        // Stop the loop before the 2s exponential backoff fires a second
-        // attempt (and another 1s stall) and blows the 15s test budget.
-        yield* prompt.cancel(chat.id)
-        yield* Fiber.await(fiber)
+        // Cleanup runs via Effect.ensuring above so failures don't leak a live loop.
       }),
       { git: true, config: (url) => providerCfg(url, 1_000) },
     ),

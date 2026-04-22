@@ -14,6 +14,8 @@ describe("session.message-v2.fromError — SSEStallError", () => {
     const result = MessageV2.fromError(error, { providerID })
 
     expect(result.name).toBe("SSEStallError")
+    expect(MessageV2.SSEStallError.isInstance(result)).toBe(true)
+    if (!MessageV2.SSEStallError.isInstance(result)) throw new Error("Expected SSEStallError")
     expect(result.data.message).toBe("SSE read timed out")
   })
 
@@ -32,6 +34,8 @@ describe("session.message-v2.fromError — SSEStallError", () => {
     const result = MessageV2.fromError(error, { providerID })
 
     expect(result.name).toBe("SSEStallError")
+    expect(MessageV2.SSEStallError.isInstance(result)).toBe(true)
+    if (!MessageV2.SSEStallError.isInstance(result)) throw new Error("Expected SSEStallError")
     expect(result.data.message).toBe("SSE chunk timeout after 120000ms")
   })
 
