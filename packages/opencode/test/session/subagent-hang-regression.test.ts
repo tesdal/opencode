@@ -1,41 +1,17 @@
 // Phase C regression gates for the subagent-hang hardening effort.
 //
-// Two failure modes this file pins down:
-//
-//   1. SSE stall = indefinite hang. If a provider starts a response and then
-//      stops sending chunks, the loop used to block forever. Phase A wrapped
-//      SSE bodies with `wrapSSE`, which raises `SSEStallError` on inter-chunk
-//      timeout. `SSEStallError` is classified transport-retryable by
-//      `SessionRetry.retryable` (see src/session/retry.ts:25) so the
-//      processor's `Effect.retry(SessionRetry.policy(...))` observes it,
-//      calls `SessionStatus.set({ type: "retry", ... })`, then backs off.
-//      The `session.error` bus event only fires AFTER retries are exhausted
-//      (5 transport attempts, 2+4+8+16+30s = 60s of backoff). This test
-//      therefore gates on the retry transition — if the stall surfaced as
-//      a terminal error instead, or hung indefinitely without triggering
-//      retry, this test fails fast.
-//
-//   2. Subagent question in headless run = deadlock. A subagent that invokes
-//      the `question` tool publishes `question.asked` and awaits an answer.
-//      In `opencode run` (headless) there is no interactive client, so
-//      Phase B added `RunEvents` which subscribes to the Bus and auto-rejects
-//      descendant questions/permissions. Without that handler the loop
-//      never returns. RunEvents lives in the CLI layer (see
-//      `src/cli/cmd/run-events.ts` + `src/cli/cmd/run.ts`); it is NOT wired
-//      into `SessionPrompt.loop` directly. This test therefore drives the
-//      loop directly and mounts an in-test subscriber that mirrors the
-//      RunEvents contract (reject descendant questions, reject permissions).
-//      That still pins the end-to-end contract — if the Bus events are no
-//      longer published, or Question.reject no longer unblocks the tool, or
-//      the task-tool flow no longer propagates subagent completion back to
-//      the parent, the test fails.
-//
-// Any change that makes either assertion fail is a regression.
+//   1. SSE stall: Phase A's wrapSSE must convert a stalled stream into
+//      SSEStallError, which SessionRetry classifies as transport-retryable
+//      and surfaces as a `retry` SessionStatus. Gates against indefinite hangs.
+//   2. Subagent question in headless: Phase B's Question→Bus publish +
+//      Question.reject→Deferred.fail contract must allow an external
+//      subscriber (mirroring RunEvents) to unblock a subagent question tool.
+//      Gates against headless deadlock when the user can't answer.
 
 import { NodeFileSystem } from "@effect/platform-node"
 import { FetchHttpClient } from "effect/unstable/http"
 import { expect } from "bun:test"
-import { Effect, Fiber, Layer } from "effect"
+import { Effect, Exit, Fiber, Layer } from "effect"
 import { Agent as AgentSvc } from "../../src/agent/agent"
 import { Bus } from "../../src/bus"
 import { Command } from "../../src/command"
@@ -252,7 +228,7 @@ it.live(
   "SSE stall triggers retry, not indefinite hang",
   () =>
     provideTmpdirServer(
-      Effect.fnUntraced(function* ({ llm }) {
+      Effect.fnUntraced(function* (input) {
         const prompt = yield* SessionPrompt.Service
         const sessions = yield* Session.Service
         const sessionStatus = yield* SessionStatus.Service
@@ -261,7 +237,7 @@ it.live(
         // sends another frame. With chunkTimeout=1000ms the loop's wrapSSE
         // fires SSEStallError after ~1s, which the retry schedule catches
         // and converts into a status transition.
-        yield* llm.push(reply().hang().item())
+        yield* input.llm.push(reply().hang().item())
 
         const chat = yield* sessions.create({
           title: "SSE stall",
@@ -310,7 +286,7 @@ it.live(
   "subagent question in headless run does not deadlock",
   () =>
     provideTmpdirServer(
-      Effect.fnUntraced(function* ({ llm }) {
+      Effect.fnUntraced(function* (input) {
         const prompt = yield* SessionPrompt.Service
         const sessions = yield* Session.Service
         const bus = yield* Bus.Service
@@ -319,7 +295,7 @@ it.live(
         const sessionStatus = yield* SessionStatus.Service
 
         // Reply 1 (root): dispatch the task tool to spawn a subagent.
-        yield* llm.tool("task", {
+        yield* input.llm.tool("task", {
           description: "ask the user",
           prompt: "use the question tool to ask the user",
           subagent_type: "general",
@@ -327,7 +303,7 @@ it.live(
         // Reply 2 (subagent): call the question tool. Our bus subscriber
         // mirrors the RunEvents contract and rejects this question, which
         // unblocks the subagent's question tool with RejectedError.
-        yield* llm.tool("question", {
+        yield* input.llm.tool("question", {
           questions: [
             {
               question: "proceed?",
@@ -383,28 +359,46 @@ it.live(
 
         const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
 
-        // Primary gate: the root fiber must complete in bounded time. If the
-        // subagent's question tool were left blocked on an unanswered
-        // deferred, this poll would never see the fiber finish. 10s upper
-        // bound — the happy-path finish is well under a second.
-        yield* Effect.promise(async () => {
-          const end = Date.now() + 10_000
-          while (Date.now() < end) {
-            if (fiber.pollUnsafe()) return
-            await new Promise((done) => setTimeout(done, 25))
-          }
-          throw new Error("root loop did not complete within 10s — subagent question likely deadlocked")
-        })
+        // Primary gate: the root fiber must complete in bounded time and
+        // succeed. Join under a 10s timeout that fails with a clear message
+        // if the loop hangs. Exit check guards against silent defect paths —
+        // a passing `pollUnsafe()` truthy check could miss these.
+        const exit = yield* Fiber.await(fiber).pipe(
+          Effect.timeoutOrElse({
+            duration: "10 seconds",
+            orElse: () => Effect.die(new Error("root loop did not complete within 10s — subagent question likely deadlocked")),
+          }),
+        )
+        expect(Exit.isSuccess(exit)).toBe(true)
 
-        // Fiber completed. The subagent's question tool should have been
-        // rejected at least once — that is the whole Phase B contract under
-        // test.
+        // Phase B contract: the subagent's question tool must have been
+        // rejected at least once via the bus subscriber.
         expect(questionsRejected).toBeGreaterThanOrEqual(1)
+
+        // The rejection must propagate into the subagent's tool output so
+        // the parent (task tool) sees the failure. Walk the root + child
+        // sessions and locate the question tool part — it must be in error
+        // state with the RejectedError message.
+        const children = yield* sessions.children(chat.id)
+        const allSessionIDs = [chat.id, ...children.map((c) => c.id)]
+        const questionErrors: string[] = []
+        for (const sid of allSessionIDs) {
+          const messages = yield* sessions.messages({ sessionID: sid })
+          for (const msg of messages) {
+            for (const part of msg.parts) {
+              if (part.type === "tool" && part.tool === "question" && part.state.status === "error") {
+                questionErrors.push(part.state.error)
+              }
+            }
+          }
+        }
+        expect(questionErrors.length).toBeGreaterThanOrEqual(1)
+        // Question.RejectedError.message => "The user dismissed this question".
+        expect(questionErrors.some((e) => /dismissed/i.test(e))).toBe(true)
+
         // And the root session should settle idle (not stuck busy).
         const finalStatus = yield* sessionStatus.get(chat.id)
         expect(finalStatus.type).toBe("idle")
-
-        yield* Fiber.await(fiber)
       }),
       { git: true, config: (url) => ({ ...providerCfg(url), agent: { general: { permission: { question: "allow" } } } }) },
     ),
