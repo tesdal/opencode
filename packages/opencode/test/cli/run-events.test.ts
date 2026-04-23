@@ -1,8 +1,9 @@
 import { describe, expect } from "bun:test"
 import * as CrossSpawnSpawner from "../../src/effect/cross-spawn-spawner"
-import { Cause, Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, Effect, Exit, Fiber, Layer, Option } from "effect"
 import { testEffect } from "../lib/effect"
 import { provideTmpdirInstance } from "../fixture/fixture"
+import { pollForLength, pollUntil } from "../lib/polling"
 import { Question } from "../../src/question"
 import { Permission } from "../../src/permission"
 import { Session } from "../../src/session"
@@ -19,32 +20,6 @@ const it = testEffect(
     CrossSpawnSpawner.defaultLayer,
   ),
 )
-
-const waitForQuestionCount = (
-  question: Question.Interface,
-  count: number,
-): Effect.Effect<ReadonlyArray<Question.Request>, Error> =>
-  Effect.gen(function* () {
-    for (const _ of Array.from({ length: 100 })) {
-      const pending = yield* question.list()
-      if (pending.length === count) return pending
-      yield* Effect.sleep("10 millis")
-    }
-    return yield* Effect.fail(new Error(`timed out waiting for ${count} question(s)`))
-  })
-
-const waitForPermissionCount = (
-  permission: Permission.Interface,
-  count: number,
-): Effect.Effect<ReadonlyArray<Permission.Request>, Error> =>
-  Effect.gen(function* () {
-    for (const _ of Array.from({ length: 100 })) {
-      const pending = yield* permission.list()
-      if (pending.length === count) return pending
-      yield* Effect.sleep("10 millis")
-    }
-    return yield* Effect.fail(new Error(`timed out waiting for ${count} permission(s)`))
-  })
 
 describe("cli/run-events", () => {
   it.live("auto-rejects question.asked for the root session (non-attach, non-json)", () =>
@@ -196,7 +171,7 @@ describe("cli/run-events", () => {
           })
           .pipe(Effect.forkScoped)
 
-        const pending = yield* waitForQuestionCount(question, 1)
+        const pending = yield* pollForLength(() => question.list(), 1)
 
         expect(handler.stats.autoRejectedQuestions).toBe(0)
         expect(pending[0].sessionID).toBe(unrelatedSessionID)
@@ -244,7 +219,7 @@ describe("cli/run-events", () => {
           })
           .pipe(Effect.forkScoped)
 
-        const pending = yield* waitForQuestionCount(question, 1)
+        const pending = yield* pollForLength(() => question.list(), 1)
         expect(pending[0].sessionID).toBe(deepSessionID)
         expect(handler.stats.autoRejectedQuestions).toBe(0)
 
@@ -371,7 +346,7 @@ describe("cli/run-events", () => {
           })
 
         const yFiber = yield* askPermission(y.id).pipe(Effect.forkScoped)
-        const firstPending = yield* waitForPermissionCount(permission, 1)
+        const firstPending = yield* pollForLength(() => permission.list(), 1)
         expect(firstPending[0].sessionID).toBe(y.id)
         expect(handler.stats.autoRejectedPermissions).toBe(0)
         yield* permission.reply({ requestID: firstPending[0].id, reply: "once" })
@@ -379,7 +354,7 @@ describe("cli/run-events", () => {
         expect(Exit.isSuccess(yExit)).toBe(true)
 
         const xFiber = yield* askPermission(x.id).pipe(Effect.forkScoped)
-        const secondPending = yield* waitForPermissionCount(permission, 1)
+        const secondPending = yield* pollForLength(() => permission.list(), 1)
         expect(secondPending[0].sessionID).toBe(x.id)
         expect(handler.stats.autoRejectedPermissions).toBe(0)
         yield* permission.reply({ requestID: secondPending[0].id, reply: "once" })
@@ -426,13 +401,10 @@ describe("cli/run-events", () => {
           }),
         )
 
-        yield* Effect.gen(function* () {
-          for (const _ of Array.from({ length: 100 })) {
-            if (replies.length === 1) return
-            yield* Effect.sleep("10 millis")
-          }
-          return yield* Effect.fail(new Error("timed out waiting for permission.replied event"))
-        })
+        yield* pollUntil(
+          () => Effect.sync(() => (replies.length === 1 ? Option.some(true) : Option.none())),
+          { label: "permission.replied event" },
+        )
 
         expect(Exit.isSuccess(exit)).toBe(true)
         expect(handler.stats.autoRejectedPermissions).toBe(0)
