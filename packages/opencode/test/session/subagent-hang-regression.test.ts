@@ -8,166 +8,30 @@
 //      subscriber (mirroring RunEvents) to unblock a subagent question tool.
 //      Gates against headless deadlock when the user can't answer.
 
-import { NodeFileSystem } from "@effect/platform-node"
-import { FetchHttpClient } from "effect/unstable/http"
 import { expect } from "bun:test"
-import { Effect, Exit, Fiber, Layer } from "effect"
-import { Agent as AgentSvc } from "../../src/agent/agent"
+import { Effect, Exit, Fiber } from "effect"
 import { Bus } from "../../src/bus"
-import { Command } from "../../src/command"
-import { Config } from "../../src/config"
-import { LSP } from "../../src/lsp"
-import { MCP } from "../../src/mcp"
 import { Permission } from "../../src/permission"
-import { Plugin } from "../../src/plugin"
-import { Provider as ProviderSvc } from "../../src/provider"
-import { Env } from "../../src/env"
 import { ModelID, ProviderID } from "../../src/provider/schema"
 import { Question } from "../../src/question"
-import { Todo } from "../../src/session/todo"
 import { Session } from "../../src/session"
-import { LLM } from "../../src/session/llm"
-import { AppFileSystem } from "@opencode-ai/shared/filesystem"
-import { SessionCompaction } from "../../src/session/compaction"
-import { SessionSummary } from "../../src/session/summary"
-import { Instruction } from "../../src/session/instruction"
-import { SessionProcessor } from "../../src/session/processor"
 import { SessionPrompt } from "../../src/session/prompt"
-import { SessionRevert } from "../../src/session/revert"
-import { SessionRunState } from "../../src/session/run-state"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionStatus } from "../../src/session/status"
-import { Skill } from "../../src/skill"
-import { SystemPrompt } from "../../src/session/system"
-import { Snapshot } from "../../src/snapshot"
-import { ToolRegistry } from "../../src/tool"
-import { Truncate } from "../../src/tool"
 import { Log } from "../../src/util"
-import * as CrossSpawnSpawner from "../../src/effect/cross-spawn-spawner"
-import { Ripgrep } from "../../src/file/ripgrep"
-import { Format } from "../../src/format"
 import { provideTmpdirServer } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
-import { reply, TestLLMServer } from "../lib/llm-server"
+import { reply } from "../lib/llm-server"
+import { makePromptLayer } from "../lib/prompt-harness"
 
 void Log.init({ print: false })
-
-const summary = Layer.succeed(
-  SessionSummary.Service,
-  SessionSummary.Service.of({
-    summarize: () => Effect.void,
-    diff: () => Effect.succeed([]),
-    computeDiff: () => Effect.succeed([]),
-  }),
-)
 
 const ref = {
   providerID: ProviderID.make("test"),
   modelID: ModelID.make("test-model"),
 }
 
-const mcp = Layer.succeed(
-  MCP.Service,
-  MCP.Service.of({
-    status: () => Effect.succeed({}),
-    clients: () => Effect.succeed({}),
-    tools: () => Effect.succeed({}),
-    prompts: () => Effect.succeed({}),
-    resources: () => Effect.succeed({}),
-    add: () => Effect.succeed({ status: { status: "disabled" as const } }),
-    connect: () => Effect.void,
-    disconnect: () => Effect.void,
-    getPrompt: () => Effect.succeed(undefined),
-    readResource: () => Effect.succeed(undefined),
-    startAuth: () => Effect.die("unexpected MCP auth in regression tests"),
-    authenticate: () => Effect.die("unexpected MCP auth in regression tests"),
-    finishAuth: () => Effect.die("unexpected MCP auth in regression tests"),
-    removeAuth: () => Effect.void,
-    supportsOAuth: () => Effect.succeed(false),
-    hasStoredTokens: () => Effect.succeed(false),
-    getAuthStatus: () => Effect.succeed("not_authenticated" as const),
-  }),
-)
-
-const lsp = Layer.succeed(
-  LSP.Service,
-  LSP.Service.of({
-    init: () => Effect.void,
-    status: () => Effect.succeed([]),
-    hasClients: () => Effect.succeed(false),
-    touchFile: () => Effect.void,
-    diagnostics: () => Effect.succeed({}),
-    hover: () => Effect.succeed(undefined),
-    definition: () => Effect.succeed([]),
-    references: () => Effect.succeed([]),
-    implementation: () => Effect.succeed([]),
-    documentSymbol: () => Effect.succeed([]),
-    workspaceSymbol: () => Effect.succeed([]),
-    prepareCallHierarchy: () => Effect.succeed([]),
-    incomingCalls: () => Effect.succeed([]),
-    outgoingCalls: () => Effect.succeed([]),
-  }),
-)
-
-const status = SessionStatus.layer.pipe(Layer.provideMerge(Bus.layer))
-const run = SessionRunState.layer.pipe(Layer.provide(status))
-const infra = Layer.mergeAll(NodeFileSystem.layer, CrossSpawnSpawner.defaultLayer)
-
-// Copied verbatim from `prompt.test.ts` — that file exports nothing,
-// so we can't import the helper. Keeping the composition identical guarantees
-// this regression gate exercises the same service wiring the rest of the
-// loop tests do (real Session/SessionPrompt/ToolRegistry/Question/Permission,
-// stubbed Summary/MCP/LSP).
-function makeHttp() {
-  const deps = Layer.mergeAll(
-    Session.defaultLayer,
-    Snapshot.defaultLayer,
-    LLM.defaultLayer,
-    Env.defaultLayer,
-    AgentSvc.defaultLayer,
-    Command.defaultLayer,
-    Permission.defaultLayer,
-    Plugin.defaultLayer,
-    Config.defaultLayer,
-    ProviderSvc.defaultLayer,
-    lsp,
-    mcp,
-    AppFileSystem.defaultLayer,
-    status,
-  ).pipe(Layer.provideMerge(infra))
-  const question = Question.layer.pipe(Layer.provideMerge(deps))
-  const todo = Todo.layer.pipe(Layer.provideMerge(deps))
-  const registry = ToolRegistry.layer.pipe(
-    Layer.provide(Skill.defaultLayer),
-    Layer.provide(FetchHttpClient.layer),
-    Layer.provide(CrossSpawnSpawner.defaultLayer),
-    Layer.provide(Ripgrep.defaultLayer),
-    Layer.provide(Format.defaultLayer),
-    Layer.provideMerge(todo),
-    Layer.provideMerge(question),
-    Layer.provideMerge(deps),
-  )
-  const trunc = Truncate.layer.pipe(Layer.provideMerge(deps))
-  const proc = SessionProcessor.layer.pipe(Layer.provide(summary), Layer.provideMerge(deps))
-  const compact = SessionCompaction.layer.pipe(Layer.provideMerge(proc), Layer.provideMerge(deps))
-  return Layer.mergeAll(
-    TestLLMServer.layer,
-    SessionPrompt.layer.pipe(
-      Layer.provide(SessionRevert.defaultLayer),
-      Layer.provide(summary),
-      Layer.provideMerge(run),
-      Layer.provideMerge(compact),
-      Layer.provideMerge(proc),
-      Layer.provideMerge(registry),
-      Layer.provideMerge(trunc),
-      Layer.provide(Instruction.defaultLayer),
-      Layer.provide(SystemPrompt.defaultLayer),
-      Layer.provideMerge(deps),
-    ),
-  ).pipe(Layer.provide(summary))
-}
-
-const it = testEffect(makeHttp())
+const it = testEffect(makePromptLayer())
 
 // Provider config matching `prompt-effect.test.ts` but with an aggressively
 // short chunkTimeout so Test A surfaces `SSEStallError` within the 4s budget
