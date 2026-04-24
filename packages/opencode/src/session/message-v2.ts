@@ -1076,9 +1076,11 @@ export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: Ses
   return filterCompacted(stream(sessionID))
 })
 
-// Legacy substring fallback for rare paths where the tagged class gets stripped
-// during cross-realm rethrow. Primary signal is `name`/`_tag` set by SSEStallError.
-const SSE_STALL_MESSAGE_RE = /SSE (read|chunk) time(d out|out)/
+// Message-based exact-match fallback for the wrapSSE() emission format.
+// The primary signals are `name === "SSEStallError"` and `_tag === "SSEStallError"`;
+// this regex only matches when that structured error identity is stripped during
+// cross-realm rethrow.
+const SSE_STALL_MESSAGE_RE = /^SSE read timed out after \d+ms$/
 
 function hasSSEStallCause(e: unknown, depth = 0): boolean {
   if (depth > 8) return false
