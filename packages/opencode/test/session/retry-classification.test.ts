@@ -14,7 +14,7 @@ describe("SessionRetry.classify", () => {
     expect(out).toEqual({ message: "SSE read timed out after 120000ms", isTransport: true })
   })
 
-  test("returns non-transport classification for APIError 500", () => {
+  test("returns non-transport classification for APIError 5xx", () => {
     const err = new MessageV2.APIError({
       message: "upstream exploded",
       statusCode: 503,
