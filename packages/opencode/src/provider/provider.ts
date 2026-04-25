@@ -48,22 +48,23 @@ function shouldUseCopilotResponsesApi(modelID: string): boolean {
 
 const DEFAULT_CHUNK_TIMEOUT_MS = 120_000
 const EXTENDED_THINKING_CHUNK_TIMEOUT_MS = 600_000
-const EXTENDED_THINKING_PROVIDERS: ReadonlySet<string> = new Set([
-  "anthropic",
-  "google-vertex-anthropic",
-  "amazon-bedrock",
-])
 
-export function resolveChunkTimeout(providerID: string, value: unknown): number {
+export function resolveChunkTimeout(
+  model: { readonly providerID: string; readonly reasoning: boolean },
+  value: unknown,
+): number {
   if (value === false) return 0
   if (typeof value === "number") {
     if (!Number.isFinite(value) || value <= 0) return 0
     return value
   }
-  if (value !== undefined) log.warn("unrecognized chunkTimeout value, using provider default", { providerID, value })
-  return EXTENDED_THINKING_PROVIDERS.has(providerID)
-    ? EXTENDED_THINKING_CHUNK_TIMEOUT_MS
-    : DEFAULT_CHUNK_TIMEOUT_MS
+  if (value !== undefined)
+    log.warn("unrecognized chunkTimeout value, using model default", {
+      providerID: model.providerID,
+      reasoning: model.reasoning,
+      value,
+    })
+  return model.reasoning ? EXTENDED_THINKING_CHUNK_TIMEOUT_MS : DEFAULT_CHUNK_TIMEOUT_MS
 }
 
 export function wrapSSE(res: Response, ms: number, ctl: AbortController) {
@@ -1468,7 +1469,10 @@ const layer: Layer.Layer<
         if (existing) return existing
 
         const customFetch = options["fetch"]
-        const resolvedChunkTimeout = resolveChunkTimeout(model.providerID, options["chunkTimeout"])
+        const resolvedChunkTimeout = resolveChunkTimeout(
+          { providerID: model.providerID, reasoning: model.capabilities.reasoning },
+          options["chunkTimeout"],
+        )
         delete options["chunkTimeout"]
 
         options["fetch"] = async (input: any, init?: BunFetchRequestInit) => {
