@@ -21,6 +21,7 @@ export interface Config {
 export interface Stats {
   autoRejectedQuestions: number
   autoRejectedPermissions: number
+  autoApprovedPermissions: number
   livelockWarned: boolean
 }
 
@@ -38,6 +39,7 @@ export const make = Effect.fn("RunEvents.make")(function* (config: Config) {
   const stats: Stats = {
     autoRejectedQuestions: 0,
     autoRejectedPermissions: 0,
+    autoApprovedPermissions: 0,
     livelockWarned: false,
   }
 
@@ -84,6 +86,20 @@ export const make = Effect.fn("RunEvents.make")(function* (config: Config) {
         rootSessionID: config.rootSessionID,
       })
     }
+  }
+
+  // No question-equivalent of bumpApprove: questions are always auto-rejected
+  // when they belong to our subagent lineage, never auto-approved. The approve
+  // counter is also intentionally separate from the livelock total — operators
+  // opt into skipPermissions and shouldn't trip the warn-threshold meant to
+  // detect auto-reject loops.
+  const bumpApprove = (sid: SessionID) => {
+    stats.autoApprovedPermissions++
+    emit("auto-approve", {
+      kind: "permission",
+      autoApproveSessionID: sid,
+      totalAutoApproves: stats.autoApprovedPermissions,
+    })
   }
 
   // bus.subscribeCallback wraps the callback in an Effect.tryPromise-based
@@ -139,6 +155,7 @@ export const make = Effect.fn("RunEvents.make")(function* (config: Config) {
         const mine = yield* isDescendant(evt.properties.sessionID)
         if (!mine) return
         if (config.skipPermissions) {
+          bumpApprove(evt.properties.sessionID)
           yield* permission.reply({ requestID: evt.properties.id, reply: "once" })
           return
         }

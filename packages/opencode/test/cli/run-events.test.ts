@@ -569,4 +569,86 @@ describe("cli/run-events", () => {
       }),
     ),
   )
+
+  // F8: when skipPermissions=true the auto-approve branch must produce symmetric
+  // telemetry — Stats counter + JSON event — so operators running
+  // --dangerously-skip-permissions get an audit trail of what was approved.
+  it.live("increments autoApprovedPermissions and emits JSON event when skipPermissions=true", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const permission = yield* Permission.Service
+        const bus = yield* Bus.Service
+        const rootSessionID = SessionID.make("ses_root_auto_approve_0000000000000")
+        const replies: Array<{ sessionID: SessionID; reply: string }> = []
+        const unsubscribeReply = yield* bus.subscribeCallback(Permission.Event.Replied, (evt) => {
+          replies.push({ sessionID: evt.properties.sessionID, reply: evt.properties.reply })
+        })
+
+        const writes: string[] = []
+        const originalWrite = process.stdout.write.bind(process.stdout)
+        process.stdout.write = ((chunk: string | Uint8Array) => {
+          writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"))
+          return true
+        }) as typeof process.stdout.write
+
+        yield* Effect.acquireUseRelease(
+          RunEvents.make({
+            rootSessionID,
+            skipPermissions: true,
+            jsonMode: true,
+          }),
+          (handle) =>
+            Effect.gen(function* () {
+              const exit = yield* Effect.exit(
+                permission.ask({
+                  sessionID: rootSessionID,
+                  permission: "bash",
+                  patterns: ["ls"],
+                  metadata: {},
+                  always: [],
+                  ruleset: [{ permission: "bash", pattern: "*", action: "ask" }],
+                }),
+              )
+
+              yield* pollUntil(
+                () => Effect.sync(() => (replies.length === 1 ? Option.some(true) : Option.none())),
+                { label: "permission.replied event" },
+              )
+
+              expect(Exit.isSuccess(exit)).toBe(true)
+              expect(replies[0]?.reply).toBe("once")
+              expect(handle.stats.autoApprovedPermissions).toBe(1)
+              expect(handle.stats.autoRejectedPermissions).toBe(0)
+            }),
+          (handle) =>
+            Effect.sync(() => {
+              unsubscribeReply()
+              handle.unsubscribe()
+            }),
+        ).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              process.stdout.write = originalWrite
+            }),
+          ),
+        )
+
+        const payload = JSON.parse((writes[0] ?? "").trim()) as {
+          type: string
+          timestamp: number
+          sessionID: string
+          kind: string
+          autoApproveSessionID: string
+          totalAutoApproves: number
+        }
+
+        expect(payload.type).toBe("auto-approve")
+        expect(typeof payload.timestamp).toBe("number")
+        expect(payload.sessionID).toBe(rootSessionID)
+        expect(payload.kind).toBe("permission")
+        expect(payload.autoApproveSessionID).toBe(rootSessionID)
+        expect(payload.totalAutoApproves).toBe(1)
+      }),
+    ),
+  )
 })
