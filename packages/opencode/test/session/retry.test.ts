@@ -5,7 +5,6 @@ import { setTimeout as sleep } from "node:timers/promises"
 import { Effect, Exit, Layer, Pull, Schedule } from "effect"
 import { SessionRetry } from "../../src/session/retry"
 import { MessageV2 } from "../../src/session/message-v2"
-import { SSEStallError } from "../../src/provider/provider"
 import { ProviderID } from "../../src/provider/schema"
 import { AppRuntime } from "../../src/effect/app-runtime"
 import { SessionID } from "../../src/session/schema"
@@ -236,7 +235,7 @@ describe("session.retry.retryable", () => {
 
 describe("SessionRetry.retryable — SSE stall round-trip", () => {
   test("retries SSEStallError after MessageV2.fromError round-trip", () => {
-    const err = new SSEStallError("SSE read timed out")
+    const err = new MessageV2.SSEStallError({ message: "SSE read timed out" })
     const obj = MessageV2.fromError(err, { providerID })
     expect(MessageV2.SSEStallError.isInstance(obj)).toBe(true)
     expect(SessionRetry.retryable(obj)).toBe("SSE read timed out")

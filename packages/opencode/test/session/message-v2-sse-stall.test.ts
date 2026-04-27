@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test"
 import { APICallError } from "ai"
-import { SSEStallError } from "../../src/provider/provider"
 import { ProviderID } from "../../src/provider/schema"
 import { MessageV2 } from "../../src/session/message-v2"
 
@@ -40,7 +39,7 @@ describe("session.message-v2.fromError — SSEStallError", () => {
   })
 
   test("detects SSE stall through two-deep cause chain", () => {
-    const stall = new SSEStallError("SSE read timed out")
+    const stall = new MessageV2.SSEStallError({ message: "SSE read timed out" })
     const middle = new Error("middle")
     middle.cause = stall
     const outer = new Error("outer")
@@ -52,7 +51,7 @@ describe("session.message-v2.fromError — SSEStallError", () => {
   })
 
   test("detects SSE stall when APICallError wraps SSEStallError", () => {
-    const stall = new SSEStallError("SSE read timed out")
+    const stall = new MessageV2.SSEStallError({ message: "SSE read timed out" })
     const apiError = new APICallError({
       message: "stream error",
       url: "https://api.githubcopilot.com/chat/completions",
@@ -64,6 +63,21 @@ describe("session.message-v2.fromError — SSEStallError", () => {
 
     expect(result.name).toBe("SSEStallError")
     expect(MessageV2.APIError.isInstance(result)).toBe(false)
+  })
+
+  test("preserves canonical wrapSSE message when fromError receives a top-level MessageV2.SSEStallError", () => {
+    // Regression for the F9 unification: schema-error instances have
+    // `.message === "SSEStallError"` (the tag, set by `super(tag, options)` in
+    // namedSchemaError), so fromError must read `.data.message` to recover the
+    // real timing text. If extractStallMessage ever regresses, the result here
+    // will be the literal string "SSEStallError" instead of the timing text.
+    const stall = new MessageV2.SSEStallError({ message: "SSE read timed out after 2ms" })
+
+    const result = MessageV2.fromError(stall, { providerID })
+
+    expect(MessageV2.SSEStallError.isInstance(result)).toBe(true)
+    if (!MessageV2.SSEStallError.isInstance(result)) throw new Error("Expected SSEStallError")
+    expect(result.data.message).toBe("SSE read timed out after 2ms")
   })
 
   test("hasSSEStallCause: tag-based detection still works", () => {

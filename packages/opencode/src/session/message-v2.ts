@@ -8,7 +8,10 @@ import { Snapshot } from "@/snapshot"
 import { SyncEvent } from "../sync"
 import { Database, NotFoundError, and, desc, eq, inArray, lt, or } from "@/storage"
 import { MessageTable, PartTable, SessionTable } from "./session.sql"
-import { ProviderError } from "@/provider"
+// Import directly from provider/error (not the @/provider barrel) to avoid a
+// circular import: provider/provider.ts now imports MessageV2 from this file,
+// and the barrel re-exports provider.ts.
+import * as ProviderError from "@/provider/error"
 import { iife } from "@/util/iife"
 import { errorMessage } from "@/util/error"
 import { isMedia } from "@/util/media"
@@ -1092,6 +1095,30 @@ function hasSSEStallCause(e: unknown, depth = 0): boolean {
   return false
 }
 
+// Extract the user-meaningful "SSE read timed out after Nms" string from an
+// error that hasSSEStallCause matched. NamedSchemaError sets Error.prototype.message
+// to the tag (`super(tag, options)` in named-schema-error.ts), so an in-process
+// throw of MessageV2.SSEStallError caught and passed back through fromError must
+// read `.data.message`, not `.message`, to recover the timing text. Plain Error
+// instances (legacy or cross-realm) put it in `.message`. Walk the cause chain
+// so nested wrappers still produce the original timing text.
+function extractStallMessage(e: unknown, depth = 0): string {
+  if (depth > 8) return String(e)
+  if (!e || typeof e !== "object") return String(e)
+  const err = e as { data?: { message?: unknown }; message?: unknown; cause?: unknown }
+  if (err.data && typeof err.data.message === "string" && SSE_STALL_MESSAGE_RE.test(err.data.message)) {
+    return err.data.message
+  }
+  if (typeof err.message === "string" && SSE_STALL_MESSAGE_RE.test(err.message)) return err.message
+  if (err.cause) return extractStallMessage(err.cause, depth + 1)
+  // hasSSEStallCause already matched; produce best-effort text even if no node
+  // has the canonical "after Nms" timing format (e.g., test fixture passes
+  // "SSE read timed out" without the suffix).
+  if (err.data && typeof err.data.message === "string") return err.data.message
+  if (typeof err.message === "string") return err.message
+  return String(e)
+}
+
 export function fromError(
   e: unknown,
   ctx: { providerID: ProviderID; aborted?: boolean },
@@ -1144,7 +1171,7 @@ export function fromError(
       ).toObject()
     case hasSSEStallCause(e):
       return new SSEStallError(
-        { message: e instanceof Error ? e.message : String(e) },
+        { message: extractStallMessage(e) },
         { cause: e instanceof Error ? e : undefined },
       ).toObject()
     case APICallError.isInstance(e):

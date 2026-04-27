@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
-import { resolveChunkTimeout, SSEStallError, wrapSSE } from "../../src/provider/provider"
+import { resolveChunkTimeout, wrapSSE } from "../../src/provider/provider"
+import { MessageV2 } from "../../src/session/message-v2"
 
 describe("provider.resolveChunkTimeout", () => {
   test("returns 120s default when undefined and reasoning=false", () => {
@@ -51,7 +52,7 @@ describe("provider.resolveChunkTimeout", () => {
 })
 
 describe("provider.wrapSSE — SSEStallError integration", () => {
-  test("throws SSEStallError when chunk read exceeds timeout", async () => {
+  test("throws MessageV2.SSEStallError when chunk read exceeds timeout", async () => {
     const stream = new ReadableStream<Uint8Array>({
       pull() {
         return new Promise<void>(() => {}) // never resolves — forces stall
@@ -62,7 +63,16 @@ describe("provider.wrapSSE — SSEStallError integration", () => {
     const wrapped = wrapSSE(res, 2, ctl)
     const reader = wrapped.body!.getReader()
 
-    await expect(reader.read()).rejects.toBeInstanceOf(SSEStallError)
+    const caught = await reader.read().then(
+      () => undefined,
+      (e) => e,
+    )
+    expect(MessageV2.SSEStallError.isInstance(caught)).toBe(true)
+    if (!MessageV2.SSEStallError.isInstance(caught)) throw new Error("expected SSEStallError")
+    expect(caught.data.message).toBe("SSE read timed out after 2ms")
+    // signal.reason and the cancel reason must share identity with the thrown error
+    expect(MessageV2.SSEStallError.isInstance(ctl.signal.reason)).toBe(true)
+    expect(ctl.signal.reason).toBe(caught)
   })
 
   test("does not wrap non-SSE responses", () => {
