@@ -1,4 +1,4 @@
-import { Effect, Option } from "effect"
+import { Cause, Effect, Fiber, Option } from "effect"
 import { Bus } from "@/bus"
 import { Permission } from "@/permission"
 import { Question } from "@/question"
@@ -86,8 +86,44 @@ export const make = Effect.fn("RunEvents.make")(function* (config: Config) {
     }
   }
 
+  // bus.subscribeCallback wraps the callback in an Effect.tryPromise-based
+  // subscription handler, so a Promise-returning callback (like Effect.runPromise)
+  // serializes handler completion per subscription. runFork returns a Fiber
+  // synchronously (non-thenable), unblocking dispatch so descendant question/
+  // permission events are processed concurrently — important for long-running
+  // subagent loops with many simultaneous descendants. Defects inside the forked
+  // fiber do not surface through that subscription callback wrapper, so log them
+  // here instead. Track in-flight fibers so unsubscribe() can interrupt them and
+  // bound handler work to the RunEvents lifecycle.
+  const inflight = new Set<Fiber.Fiber<void>>()
+  let closed = false
+  const fork = (effect: Effect.Effect<void>) => {
+    if (closed) {
+      // unsubscribe() already ran but bus subscription teardown is async, so
+      // a late callback can still reach fork(). Skip starting the handler
+      // entirely so no side effects (bump, reject, reply) leak past teardown.
+      // Returning undefined (not a Promise) still unblocks the bus dispatch
+      // wrapper without spawning a no-op fiber.
+      return
+    }
+    const fiber = Effect.runFork(
+      effect.pipe(
+        Effect.tapCause((cause) =>
+          Cause.hasInterruptsOnly(cause)
+            ? Effect.void
+            : Effect.sync(() => log.error("handler failed", { cause })),
+        ),
+      ),
+    )
+    inflight.add(fiber)
+    // Register cleanup outside the forked effect to avoid a TDZ/race between
+    // synchronous fiber completion and inflight.add — Fiber.await observes
+    // completion regardless of how fast the fiber runs.
+    Effect.runFork(Fiber.await(fiber).pipe(Effect.ensuring(Effect.sync(() => inflight.delete(fiber)))))
+  }
+
   const unsubQuestion = yield* bus.subscribeCallback(Question.Event.Asked, (evt) =>
-    Effect.runPromise(
+    fork(
       Effect.gen(function* () {
         const mine = yield* isDescendant(evt.properties.sessionID)
         if (!mine) return
@@ -98,7 +134,7 @@ export const make = Effect.fn("RunEvents.make")(function* (config: Config) {
   )
 
   const unsubPermission = yield* bus.subscribeCallback(Permission.Event.Asked, (evt) =>
-    Effect.runPromise(
+    fork(
       Effect.gen(function* () {
         const mine = yield* isDescendant(evt.properties.sessionID)
         if (!mine) return
@@ -113,8 +149,13 @@ export const make = Effect.fn("RunEvents.make")(function* (config: Config) {
   )
 
   const unsubscribe = () => {
+    closed = true
     unsubQuestion()
     unsubPermission()
+    inflight.forEach((fiber) => Effect.runFork(Fiber.interrupt(fiber)))
+    // Don't clear() — let the per-fiber Fiber.await observers remove entries
+    // as their interrupts settle, so any stragglers caught by the closed-flag
+    // branch above still get cleaned up correctly.
   }
 
   return { stats, unsubscribe } satisfies Handle

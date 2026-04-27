@@ -523,4 +523,50 @@ describe("cli/run-events", () => {
       }),
     ),
   )
+
+  // Lifecycle test for F7 fiber-tracking: after unsubscribe(), late-arriving
+  // bus callbacks must not produce new auto-rejects. This exercises both the
+  // bus unsubscription path and the `closed` flag in fork() that prevents
+  // late callbacks from forking new handler fibers after teardown has begun.
+  it.live("does not auto-reject question.asked after unsubscribe()", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const question = yield* Question.Service
+        const rootSessionID = SessionID.make("ses_root_post_unsub_000000000000")
+        const handler = yield* RunEvents.make({
+          rootSessionID,
+          skipPermissions: false,
+          jsonMode: false,
+        })
+        yield* Effect.sync(() => handler.unsubscribe())
+
+        // Ask after unsubscribe — without the bus subscription, no auto-reject
+        // handler runs and the question stays pending.
+        const fiber = yield* question
+          .ask({
+            sessionID: rootSessionID,
+            questions: [{ question: "post?", header: "h", options: [{ label: "x", description: "x" }] }],
+          })
+          .pipe(Effect.forkScoped)
+
+        const pending = yield* pollForLength(() => question.list(), 1)
+        expect(pending[0].sessionID).toBe(rootSessionID)
+        expect(handler.stats.autoRejectedQuestions).toBe(0)
+
+        // Give any late async bus callbacks a chance to run, then verify the
+        // question is still pending and no auto-reject occurred.
+        yield* Effect.sleep("50 millis")
+        const stillPending = yield* question.list()
+        expect(stillPending).toHaveLength(1)
+        expect(stillPending[0].id).toBe(pending[0].id)
+        expect(stillPending[0].sessionID).toBe(rootSessionID)
+        expect(handler.stats.autoRejectedQuestions).toBe(0)
+
+        // Manually clear the pending question so the test can finish.
+        yield* question.reject(pending[0].id)
+        const exit = yield* Fiber.await(fiber)
+        expect(Exit.isFailure(exit)).toBe(true)
+      }),
+    ),
+  )
 })
