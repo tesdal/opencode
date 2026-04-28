@@ -29,16 +29,12 @@ import { withStatics } from "@/util/schema"
 
 import * as ProviderTransform from "./transform"
 import { ModelID, ProviderID } from "./schema"
+// message-v2 imports ProviderError directly from @/provider/error (not the
+// @/provider barrel), so this back-edge does not form a cycle through
+// provider.ts. Do not change the import in message-v2.ts back to the barrel.
+import { MessageV2 } from "@/session/message-v2"
 
 const log = Log.create({ service: "provider" })
-
-export class SSEStallError extends Error {
-  readonly _tag = "SSEStallError"
-  constructor(message: string) {
-    super(message)
-    this.name = "SSEStallError"
-  }
-}
 
 function shouldUseCopilotResponsesApi(modelID: string): boolean {
   const match = /^gpt-(\d+)/.exec(modelID)
@@ -77,7 +73,7 @@ export function wrapSSE(res: Response, ms: number, ctl: AbortController) {
     async pull(ctrl) {
       const part = await new Promise<Awaited<ReturnType<typeof reader.read>>>((resolve, reject) => {
         const id = setTimeout(() => {
-          const err = new SSEStallError(`SSE read timed out after ${ms}ms`)
+          const err = new MessageV2.SSEStallError({ message: `SSE read timed out after ${ms}ms` })
           ctl.abort(err)
           void reader.cancel(err)
           reject(err)
