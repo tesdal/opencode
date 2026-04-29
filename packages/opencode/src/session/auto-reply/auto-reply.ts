@@ -1,9 +1,8 @@
-import { Cause, Effect, Fiber, Option } from "effect"
+import { Cause, Effect, Fiber } from "effect"
 import { Bus } from "@/bus"
 import { Permission } from "@/permission"
 import { Question } from "@/question"
 import { Session } from "@/session"
-import { NotFoundError } from "@/storage"
 import { SessionID } from "@/session/schema"
 import { Log } from "@/util"
 import type { Sink } from "./sink"
@@ -49,28 +48,8 @@ export const make = Effect.fn("SessionAutoReply.make")(function* (config: Config
 
   const descendants = new Set<SessionID>([config.rootSessionID])
 
-  const isDescendant = Effect.fn("SessionAutoReply.isDescendant")(function* (sid: SessionID) {
-    if (descendants.has(sid)) return true
-    let cur: SessionID | undefined = sid
-    const chain: SessionID[] = []
-    let depth = 0
-    while (cur !== undefined && !descendants.has(cur) && depth < MAX_LINEAGE_DEPTH) {
-      chain.push(cur)
-      depth++
-      const lookup: Option.Option<Session.Info> = yield* session.get(cur).pipe(
-        Effect.option,
-        Effect.catchDefect((defect) => {
-          if (!NotFoundError.isInstance(defect)) return Effect.die(defect)
-          return Effect.succeed(Option.none<Session.Info>())
-        }),
-      )
-      if (Option.isNone(lookup)) break
-      cur = lookup.value.parentID ?? undefined
-    }
-    if (cur === undefined || !descendants.has(cur)) return false
-    chain.forEach((item) => descendants.add(item))
-    return true
-  })
+  const isDescendant = (sid: SessionID) =>
+    session.isDescendantOf(sid, config.rootSessionID, { maxDepth: MAX_LINEAGE_DEPTH, cache: descendants })
 
   const bump = (kind: "question" | "permission", sid: SessionID) => {
     if (kind === "question") stats.autoRejectedQuestions++

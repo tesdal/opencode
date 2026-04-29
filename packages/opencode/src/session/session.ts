@@ -375,6 +375,22 @@ export interface Interface {
     sessionID: SessionID,
     predicate: (msg: MessageV2.WithParts) => boolean,
   ) => Effect.Effect<Option.Option<MessageV2.WithParts>>
+  /**
+   * Returns true if `sid` is `root` or transitively descends from `root` via
+   * `parentID`. Walks the parent chain up to `opts.maxDepth` (default 64) and
+   * stops at any `NotFoundError` (returns false). When `opts.cache` is
+   * provided, it is used both as a positive-hit short-circuit and as an
+   * accumulator: every confirmed descendant in the walked chain is added to
+   * the set. Callers that issue many `isDescendantOf` calls against the same
+   * root (e.g. SessionAutoReply) should seed the cache with `new Set([root])`
+   * and reuse it across calls so the parent chain is traversed at most once
+   * per node.
+   */
+  readonly isDescendantOf: (
+    sid: SessionID,
+    root: SessionID,
+    opts?: { maxDepth?: number; cache?: Set<SessionID> },
+  ) => Effect.Effect<boolean>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Session") {}
@@ -671,6 +687,39 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Storage.Service> =
       return Option.none<MessageV2.WithParts>()
     })
 
+    const isDescendantOf = Effect.fn("Session.isDescendantOf")(function* (
+      sid: SessionID,
+      root: SessionID,
+      opts?: { maxDepth?: number; cache?: Set<SessionID> },
+    ) {
+      const maxDepth = opts?.maxDepth ?? 64
+      const known = opts?.cache ?? new Set<SessionID>([root])
+      if (sid === root) return true
+      if (known.has(sid)) return true
+      // Walk parent chain. Track the chain so we can promote every visited
+      // node into the cache once we hit a known descendant — turns repeated
+      // calls against the same lineage into O(1) after the first walk.
+      const chain: SessionID[] = []
+      let cur: SessionID | undefined = sid
+      let depth = 0
+      while (cur !== undefined && !known.has(cur) && depth < maxDepth) {
+        chain.push(cur)
+        depth++
+        const lookup: Option.Option<Info> = yield* get(cur).pipe(
+          Effect.option,
+          Effect.catchDefect((defect) => {
+            if (!NotFoundError.isInstance(defect)) return Effect.die(defect)
+            return Effect.succeed(Option.none<Info>())
+          }),
+        )
+        if (Option.isNone(lookup)) break
+        cur = lookup.value.parentID ?? undefined
+      }
+      if (cur === undefined || !known.has(cur)) return false
+      chain.forEach((item) => known.add(item))
+      return true
+    })
+
     return Service.of({
       create,
       fork,
@@ -693,6 +742,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Storage.Service> =
       getPart,
       updatePartDelta,
       findMessage,
+      isDescendantOf,
     })
   }),
 )
