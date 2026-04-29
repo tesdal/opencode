@@ -5,7 +5,7 @@
 //      and surfaces as a `retry` SessionStatus. Gates against indefinite hangs.
 //   2. Subagent question in headless: Phase B's Question→Bus publish +
 //      Question.reject→Deferred.fail contract must allow an external
-//      subscriber (mirroring RunEvents) to unblock a subagent question tool.
+//      subscriber (mirroring SessionAutoReply) to unblock a subagent question tool.
 //      Gates against headless deadlock when the user can't answer.
 
 import { expect } from "bun:test"
@@ -173,7 +173,7 @@ it.live(
           subagent_type: "general",
         })
         // Reply 2 (subagent): call the question tool. Our bus subscriber
-        // mirrors the RunEvents contract and rejects this question, which
+        // mirrors the SessionAutoReply contract and rejects this question, which
         // unblocks the subagent's question tool with RejectedError.
         yield* input.llm.tool("question", {
           questions: [
@@ -201,7 +201,7 @@ it.live(
         })
         yield* user(chat.id, "please ask something")
 
-        // Mirror of RunEvents.make semantics (see src/cli/cmd/run-events.ts):
+        // Mirror of SessionAutoReply.make semantics (see src/session/auto-reply/auto-reply.ts):
         // reject any question or permission raised on a descendant of the
         // root session. This test is a single root with one subagent, so we
         // reject indiscriminately — the production handler does parent-chain

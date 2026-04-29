@@ -9,7 +9,8 @@ import { Permission } from "../../src/permission"
 import { Session } from "../../src/session"
 import { Bus } from "../../src/bus"
 import { SessionID } from "../../src/session/schema"
-import { MAX_LINEAGE_DEPTH, RunEvents } from "../../src/cli/cmd/run-events"
+import { MAX_LINEAGE_DEPTH, SessionAutoReply } from "../../src/session/auto-reply/auto-reply"
+import { AutoReplySink } from "../../src/session/auto-reply/sink"
 
 const it = testEffect(
   Layer.mergeAll(
@@ -21,17 +22,36 @@ const it = testEffect(
   ),
 )
 
-describe("cli/run-events", () => {
-  it.live("auto-rejects question.asked for the root session (non-attach, non-json)", () =>
+// Test sink that captures every Sink event into a single ordered array. Lets
+// jsonMode-equivalent tests assert on the auto-reject/auto-approve contract
+// without monkey-patching process.stdout (the previous RunEvents test pattern).
+type CapturedEvent =
+  | { readonly type: "auto-reject"; readonly kind: "question" | "permission"; readonly sessionID: SessionID; readonly total: number }
+  | { readonly type: "auto-approve"; readonly kind: "permission"; readonly sessionID: SessionID; readonly total: number }
+  | { readonly type: "livelock-warn"; readonly rootSessionID: SessionID }
+
+function captureSink() {
+  const events: CapturedEvent[] = []
+  const sink: AutoReplySink.Sink = {
+    onAutoReject: (input) =>
+      events.push({ type: "auto-reject", kind: input.kind, sessionID: input.sessionID, total: input.total }),
+    onAutoApprove: (input) =>
+      events.push({ type: "auto-approve", kind: input.kind, sessionID: input.sessionID, total: input.total }),
+    onLivelockWarn: (input) => events.push({ type: "livelock-warn", rootSessionID: input.rootSessionID }),
+  }
+  return { sink, events }
+}
+
+describe("session/auto-reply", () => {
+  it.live("auto-rejects question.asked for the root session", () =>
     provideTmpdirInstance(() =>
       Effect.gen(function* () {
         const question = yield* Question.Service
         const rootSessionID = SessionID.make("ses_root_0000000000000000000000")
-        const handler = yield* RunEvents.make({
-          rootSessionID,
-          skipPermissions: false,
-          jsonMode: false,
-        })
+        const handler = yield* SessionAutoReply.make(
+          { rootSessionID, skipPermissions: false },
+          AutoReplySink.silentSink,
+        )
 
         const result = yield* Effect.exit(
           question.ask({
@@ -62,11 +82,10 @@ describe("cli/run-events", () => {
         const session = yield* Session.Service
         const rootSessionID = SessionID.make("ses_root_desc_0000000000000000")
         const child = yield* session.create({ parentID: rootSessionID, title: "Child" })
-        const handler = yield* RunEvents.make({
-          rootSessionID,
-          skipPermissions: false,
-          jsonMode: false,
-        })
+        const handler = yield* SessionAutoReply.make(
+          { rootSessionID, skipPermissions: false },
+          AutoReplySink.silentSink,
+        )
 
         const result = yield* Effect.exit(
           question.ask({
@@ -98,11 +117,10 @@ describe("cli/run-events", () => {
         const rootSessionID = SessionID.make("ses_root_grandchild_0000000000000")
         const middle = yield* session.create({ parentID: rootSessionID, title: "Middle" })
         const child = yield* session.create({ parentID: middle.id, title: "Grandchild" })
-        const handler = yield* RunEvents.make({
-          rootSessionID,
-          skipPermissions: false,
-          jsonMode: false,
-        })
+        const handler = yield* SessionAutoReply.make(
+          { rootSessionID, skipPermissions: false },
+          AutoReplySink.silentSink,
+        )
 
         const childResult = yield* Effect.exit(
           question.ask({
@@ -152,11 +170,10 @@ describe("cli/run-events", () => {
         const question = yield* Question.Service
         const rootSessionID = SessionID.make("ses_root_unrelated_000000000000")
         const unrelatedSessionID = SessionID.make("ses_unrelated_000000000000000")
-        const handler = yield* RunEvents.make({
-          rootSessionID,
-          skipPermissions: false,
-          jsonMode: false,
-        })
+        const handler = yield* SessionAutoReply.make(
+          { rootSessionID, skipPermissions: false },
+          AutoReplySink.silentSink,
+        )
 
         const fiber = yield* question
           .ask({
@@ -192,11 +209,10 @@ describe("cli/run-events", () => {
         const question = yield* Question.Service
         const session = yield* Session.Service
         const rootSessionID = SessionID.make("ses_root_depth_cutoff_000000000000")
-        const handler = yield* RunEvents.make({
-          rootSessionID,
-          skipPermissions: false,
-          jsonMode: false,
-        })
+        const handler = yield* SessionAutoReply.make(
+          { rootSessionID, skipPermissions: false },
+          AutoReplySink.silentSink,
+        )
 
         const createDeepChild = (parentID: SessionID, remaining: number): Effect.Effect<SessionID> => {
           if (remaining === 0) return Effect.succeed(parentID)
@@ -233,21 +249,21 @@ describe("cli/run-events", () => {
     ),
   )
 
-  it.live("RunEvents.Config does not expose an attach field", () =>
+  it.live("Config does not expose attach or jsonMode fields", () =>
     Effect.sync(() => {
-      const validConfig: RunEvents.Config = {
+      const validConfig: SessionAutoReply.Config = {
         rootSessionID: SessionID.make("ses_root_cfg_0000000000000000000"),
         skipPermissions: false,
-        jsonMode: false,
       }
       void validConfig
 
-      const invalidConfig: RunEvents.Config = {
+      const invalidConfig: SessionAutoReply.Config = {
         rootSessionID: SessionID.make("ses_root_cfg_0000000000000000001"),
         skipPermissions: false,
-        jsonMode: false,
-        // @ts-expect-error attach mode is represented by not creating RunEvents
+        // @ts-expect-error attach mode is represented by not creating SessionAutoReply,
+        // and jsonMode is now a caller (run.ts) sink concern, not core config
         attach: true,
+        jsonMode: true,
       }
       void invalidConfig
     }),
@@ -260,11 +276,10 @@ describe("cli/run-events", () => {
         const session = yield* Session.Service
         const rootSessionID = SessionID.make("ses_root_perm_desc_000000000000")
         const child = yield* session.create({ parentID: rootSessionID, title: "Child" })
-        const handler = yield* RunEvents.make({
-          rootSessionID,
-          skipPermissions: false,
-          jsonMode: false,
-        })
+        const handler = yield* SessionAutoReply.make(
+          { rootSessionID, skipPermissions: false },
+          AutoReplySink.silentSink,
+        )
 
         const fiber = yield* permission
           .ask({
@@ -294,11 +309,10 @@ describe("cli/run-events", () => {
         const session = yield* Session.Service
         const rootSessionID = SessionID.make("ses_root_skip_perm_000000000000")
         const child = yield* session.create({ parentID: rootSessionID, title: "Child" })
-        const handler = yield* RunEvents.make({
-          rootSessionID,
-          skipPermissions: true,
-          jsonMode: false,
-        })
+        const handler = yield* SessionAutoReply.make(
+          { rootSessionID, skipPermissions: true },
+          AutoReplySink.silentSink,
+        )
 
         const exit = yield* Effect.exit(
           permission.ask({
@@ -329,11 +343,10 @@ describe("cli/run-events", () => {
         const unrelatedRootSessionID = SessionID.make("ses_unrelated_root_000000000000")
         const x = yield* session.create({ parentID: unrelatedRootSessionID, title: "X" })
         const y = yield* session.create({ parentID: x.id, title: "Y" })
-        const handler = yield* RunEvents.make({
-          rootSessionID,
-          skipPermissions: false,
-          jsonMode: false,
-        })
+        const handler = yield* SessionAutoReply.make(
+          { rootSessionID, skipPermissions: false },
+          AutoReplySink.silentSink,
+        )
 
         const askPermission = (sessionID: SessionID) =>
           permission.ask({
@@ -384,11 +397,10 @@ describe("cli/run-events", () => {
         const unsubscribeReply = yield* bus.subscribeCallback(Permission.Event.Replied, (evt) => {
           replies.push({ sessionID: evt.properties.sessionID, reply: evt.properties.reply })
         })
-        const handler = yield* RunEvents.make({
-          rootSessionID,
-          skipPermissions: true,
-          jsonMode: false,
-        })
+        const handler = yield* SessionAutoReply.make(
+          { rootSessionID, skipPermissions: true },
+          AutoReplySink.silentSink,
+        )
 
         const exit = yield* Effect.exit(
           permission.ask({
@@ -420,24 +432,19 @@ describe("cli/run-events", () => {
     ),
   )
 
-  it.live("emits structured JSON event to stdout when jsonMode=true", () =>
+  // F11: jsonMode emission moved out of the core into run.ts's sink. The core
+  // contract is now "Sink.onAutoReject is invoked with the right shape" — JSON
+  // serialization is verified separately by the run.ts sink builder. This
+  // replaces the previous stdout-monkey-patching jsonMode test.
+  it.live("calls Sink.onAutoReject with kind='question' on auto-reject", () =>
     provideTmpdirInstance(() =>
       Effect.gen(function* () {
         const question = yield* Question.Service
-        const rootSessionID = SessionID.make("ses_root_json_00000000000000000000")
-        const writes: string[] = []
-        const originalWrite = process.stdout.write.bind(process.stdout)
-        process.stdout.write = ((chunk: string | Uint8Array) => {
-          writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"))
-          return true
-        }) as typeof process.stdout.write
+        const rootSessionID = SessionID.make("ses_root_sink_reject_000000000000")
+        const captured = captureSink()
 
         yield* Effect.acquireUseRelease(
-          RunEvents.make({
-            rootSessionID,
-            skipPermissions: false,
-            jsonMode: true,
-          }),
+          SessionAutoReply.make({ rootSessionID, skipPermissions: false }, captured.sink),
           (handle) =>
             Effect.gen(function* () {
               const result = yield* Effect.exit(
@@ -456,43 +463,29 @@ describe("cli/run-events", () => {
               expect(handle.stats.autoRejectedQuestions).toBe(1)
             }),
           (handle) => Effect.sync(() => handle.unsubscribe()),
-        ).pipe(
-          Effect.ensuring(
-            Effect.sync(() => {
-              process.stdout.write = originalWrite
-            }),
-          ),
         )
 
-        const payload = JSON.parse((writes[0] ?? "").trim()) as {
-          type: string
-          timestamp: number
-          sessionID: string
-          kind: string
-          autoRejectSessionID: string
-          totalAutoRejects: number
-        }
-
-        expect(payload.type).toBe("auto-reject")
-        expect(typeof payload.timestamp).toBe("number")
-        expect(payload.sessionID).toBe(rootSessionID)
-        expect(payload.kind).toBe("question")
-        expect(payload.autoRejectSessionID).toBe(rootSessionID)
-        expect(payload.totalAutoRejects).toBe(1)
+        expect(captured.events).toHaveLength(1)
+        expect(captured.events[0]).toEqual({
+          type: "auto-reject",
+          kind: "question",
+          sessionID: rootSessionID,
+          total: 1,
+        })
       }),
     ),
   )
 
-  it.live("sets livelockWarned=true on the 6th cumulative auto-reject", () =>
+  it.live("sets livelockWarned=true and calls onLivelockWarn on the 6th cumulative auto-reject", () =>
     provideTmpdirInstance(() =>
       Effect.gen(function* () {
         const question = yield* Question.Service
         const rootSessionID = SessionID.make("ses_root_livelock_000000000000000")
-        const handler = yield* RunEvents.make({
-          rootSessionID,
-          skipPermissions: false,
-          jsonMode: false,
-        })
+        const captured = captureSink()
+        const handler = yield* SessionAutoReply.make(
+          { rootSessionID, skipPermissions: false },
+          captured.sink,
+        )
 
         const askOnce = () =>
           Effect.exit(
@@ -513,11 +506,16 @@ describe("cli/run-events", () => {
         })
         expect(firstFiveExits.every(Exit.isFailure)).toBe(true)
         expect(handler.stats.livelockWarned).toBe(false)
+        expect(captured.events.filter((e) => e.type === "livelock-warn")).toHaveLength(0)
 
         const sixthExit = yield* askOnce()
         expect(Exit.isFailure(sixthExit)).toBe(true)
         expect(handler.stats.autoRejectedQuestions).toBe(6)
         expect(handler.stats.livelockWarned).toBe(true)
+
+        const livelockEvents = captured.events.filter((e) => e.type === "livelock-warn")
+        expect(livelockEvents).toHaveLength(1)
+        expect(livelockEvents[0]).toEqual({ type: "livelock-warn", rootSessionID })
 
         yield* Effect.sync(() => handler.unsubscribe())
       }),
@@ -533,11 +531,10 @@ describe("cli/run-events", () => {
       Effect.gen(function* () {
         const question = yield* Question.Service
         const rootSessionID = SessionID.make("ses_root_post_unsub_000000000000")
-        const handler = yield* RunEvents.make({
-          rootSessionID,
-          skipPermissions: false,
-          jsonMode: false,
-        })
+        const handler = yield* SessionAutoReply.make(
+          { rootSessionID, skipPermissions: false },
+          AutoReplySink.silentSink,
+        )
         yield* Effect.sync(() => handler.unsubscribe())
 
         // Ask after unsubscribe — without the bus subscription, no auto-reject
@@ -571,9 +568,9 @@ describe("cli/run-events", () => {
   )
 
   // F8: when skipPermissions=true the auto-approve branch must produce symmetric
-  // telemetry — Stats counter + JSON event — so operators running
+  // telemetry — Stats counter + Sink event — so operators running
   // --dangerously-skip-permissions get an audit trail of what was approved.
-  it.live("increments autoApprovedPermissions and emits JSON event when skipPermissions=true", () =>
+  it.live("increments autoApprovedPermissions and calls Sink.onAutoApprove when skipPermissions=true", () =>
     provideTmpdirInstance(() =>
       Effect.gen(function* () {
         const permission = yield* Permission.Service
@@ -583,20 +580,10 @@ describe("cli/run-events", () => {
         const unsubscribeReply = yield* bus.subscribeCallback(Permission.Event.Replied, (evt) => {
           replies.push({ sessionID: evt.properties.sessionID, reply: evt.properties.reply })
         })
-
-        const writes: string[] = []
-        const originalWrite = process.stdout.write.bind(process.stdout)
-        process.stdout.write = ((chunk: string | Uint8Array) => {
-          writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"))
-          return true
-        }) as typeof process.stdout.write
+        const captured = captureSink()
 
         yield* Effect.acquireUseRelease(
-          RunEvents.make({
-            rootSessionID,
-            skipPermissions: true,
-            jsonMode: true,
-          }),
+          SessionAutoReply.make({ rootSessionID, skipPermissions: true }, captured.sink),
           (handle) =>
             Effect.gen(function* () {
               const exit = yield* Effect.exit(
@@ -625,29 +612,15 @@ describe("cli/run-events", () => {
               unsubscribeReply()
               handle.unsubscribe()
             }),
-        ).pipe(
-          Effect.ensuring(
-            Effect.sync(() => {
-              process.stdout.write = originalWrite
-            }),
-          ),
         )
 
-        const payload = JSON.parse((writes[0] ?? "").trim()) as {
-          type: string
-          timestamp: number
-          sessionID: string
-          kind: string
-          autoApproveSessionID: string
-          totalAutoApproves: number
-        }
-
-        expect(payload.type).toBe("auto-approve")
-        expect(typeof payload.timestamp).toBe("number")
-        expect(payload.sessionID).toBe(rootSessionID)
-        expect(payload.kind).toBe("permission")
-        expect(payload.autoApproveSessionID).toBe(rootSessionID)
-        expect(payload.totalAutoApproves).toBe(1)
+        expect(captured.events).toHaveLength(1)
+        expect(captured.events[0]).toEqual({
+          type: "auto-approve",
+          kind: "permission",
+          sessionID: rootSessionID,
+          total: 1,
+        })
       }),
     ),
   )

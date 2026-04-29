@@ -6,31 +6,35 @@ import { Session } from "@/session"
 import { NotFoundError } from "@/storage"
 import { SessionID } from "@/session/schema"
 import { Log } from "@/util"
+import type { Sink } from "./sink"
 
-const log = Log.create({ service: "run-events" })
+const log = Log.create({ service: "session-auto-reply" })
 
 export const LIVELOCK_WARN_THRESHOLD = 5
 export const MAX_LINEAGE_DEPTH = 32
 
-export interface Config {
+export type Config = {
   rootSessionID: SessionID
   skipPermissions: boolean
-  jsonMode: boolean
 }
 
-export interface Stats {
+export type Stats = {
   autoRejectedQuestions: number
   autoRejectedPermissions: number
   autoApprovedPermissions: number
   livelockWarned: boolean
 }
 
-export interface Handle {
+export type Handle = {
   readonly stats: Stats
   readonly unsubscribe: () => void
 }
 
-export const make = Effect.fn("RunEvents.make")(function* (config: Config) {
+// TODO(auto-reply-acp): ACP has equivalent auto-permission-reply logic in
+// src/acp/*. Unifying it on top of this core (so ACP also goes through Sink)
+// is deferred to a follow-up PR — F11 only extracts CLI's RunEvents into
+// reusable shape. One subsystem rework at a time.
+export const make = Effect.fn("SessionAutoReply.make")(function* (config: Config, sink: Sink) {
   const question = yield* Question.Service
   const permission = yield* Permission.Service
   const bus = yield* Bus.Service
@@ -45,14 +49,7 @@ export const make = Effect.fn("RunEvents.make")(function* (config: Config) {
 
   const descendants = new Set<SessionID>([config.rootSessionID])
 
-  const emit = (type: string, data: Record<string, unknown>) => {
-    if (!config.jsonMode) return
-    process.stdout.write(
-      JSON.stringify({ type, timestamp: Date.now(), sessionID: config.rootSessionID, ...data }) + "\n",
-    )
-  }
-
-  const isDescendant = Effect.fn("RunEvents.isDescendant")(function* (sid: SessionID) {
+  const isDescendant = Effect.fn("SessionAutoReply.isDescendant")(function* (sid: SessionID) {
     if (descendants.has(sid)) return true
     let cur: SessionID | undefined = sid
     const chain: SessionID[] = []
@@ -79,12 +76,13 @@ export const make = Effect.fn("RunEvents.make")(function* (config: Config) {
     if (kind === "question") stats.autoRejectedQuestions++
     else stats.autoRejectedPermissions++
     const total = stats.autoRejectedQuestions + stats.autoRejectedPermissions
-    emit("auto-reject", { kind, autoRejectSessionID: sid, totalAutoRejects: total })
+    sink.onAutoReject({ kind, sessionID: sid, total })
     if (!stats.livelockWarned && total > LIVELOCK_WARN_THRESHOLD) {
       stats.livelockWarned = true
       log.warn("possible subagent livelock: >5 auto-rejects in a single run", {
         rootSessionID: config.rootSessionID,
       })
+      sink.onLivelockWarn({ rootSessionID: config.rootSessionID })
     }
   }
 
@@ -95,11 +93,7 @@ export const make = Effect.fn("RunEvents.make")(function* (config: Config) {
   // detect auto-reject loops.
   const bumpApprove = (sid: SessionID) => {
     stats.autoApprovedPermissions++
-    emit("auto-approve", {
-      kind: "permission",
-      autoApproveSessionID: sid,
-      totalAutoApproves: stats.autoApprovedPermissions,
-    })
+    sink.onAutoApprove({ kind: "permission", sessionID: sid, total: stats.autoApprovedPermissions })
   }
 
   // bus.subscribeCallback wraps the callback in an Effect.tryPromise-based
@@ -110,7 +104,7 @@ export const make = Effect.fn("RunEvents.make")(function* (config: Config) {
   // subagent loops with many simultaneous descendants. Defects inside the forked
   // fiber do not surface through that subscription callback wrapper, so log them
   // here instead. Track in-flight fibers so unsubscribe() can interrupt them and
-  // bound handler work to the RunEvents lifecycle.
+  // bound handler work to the AutoReply lifecycle.
   const inflight = new Set<Fiber.Fiber<void>>()
   let closed = false
   const fork = (effect: Effect.Effect<void>) => {
@@ -178,4 +172,4 @@ export const make = Effect.fn("RunEvents.make")(function* (config: Config) {
   return { stats, unsubscribe } satisfies Handle
 })
 
-export * as RunEvents from "./run-events"
+export * as SessionAutoReply from "./auto-reply"
