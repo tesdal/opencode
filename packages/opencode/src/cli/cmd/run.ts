@@ -28,7 +28,8 @@ import { TodoWriteTool } from "../../tool/todo"
 import { Locale } from "../../util"
 import { AppRuntime } from "@/effect/app-runtime"
 import { SessionID } from "@/session/schema"
-import { RunEvents } from "./run-events"
+import { SessionAutoReply } from "@/session/auto-reply/auto-reply"
+import { silentSink as silentAutoReplySink, type Sink as AutoReplySink } from "@/session/auto-reply/sink"
 
 type ToolProps<T> = {
   input: Tool.InferParameters<T>
@@ -213,18 +214,70 @@ function normalizePath(input?: string) {
 }
 
 /**
+ * Build the auto-reply Sink for `opencode run`. Decouples emission policy
+ * (stdout JSON when jsonMode, no-op otherwise) from the auto-reply core in
+ * `src/session/auto-reply/`. ACP/TUI/daemon will provide their own sinks
+ * routing to their own transports — see TODO(auto-reply-acp) in auto-reply.ts.
+ *
+ * Exported for unit-test access only — operators rely on the JSON shape
+ * (`autoRejectSessionID`/`totalAutoRejects`/etc) emitted under jsonMode, so
+ * this builder pins that external CLI contract independently of the sink
+ * callback signature.
+ */
+export function makeRunSink(jsonMode: boolean, rootSessionID: SessionID): AutoReplySink {
+  // The non-jsonMode case has no UI side: the dispatchPermissionAsked path
+  // handles the per-event UI line, livelock warnings already log via the core
+  // log.warn, and stats counters live on the returned Handle. silentSink is
+  // the right object — reuse it instead of duplicating the shape.
+  if (!jsonMode) return silentAutoReplySink
+  const emit = (type: string, data: Record<string, unknown>) => {
+    // Sink contract requires callbacks not to throw (see Sink JSDoc in
+    // src/session/auto-reply/sink.ts). process.stdout.write can throw on
+    // EPIPE (downstream consumer closed the pipe), and JSON.stringify is
+    // safe today but defended against future shape changes. Swallow the
+    // failure so the auto-reply fiber's question.reject / permission.reply
+    // side effect still runs.
+    try {
+      process.stdout.write(JSON.stringify({ type, timestamp: Date.now(), sessionID: rootSessionID, ...data }) + "\n")
+    } catch {
+      // intentionally empty — see contract note above
+    }
+  }
+  return {
+    onAutoReject: (input) =>
+      emit("auto-reject", {
+        kind: input.kind,
+        autoRejectSessionID: input.sessionID,
+        totalAutoRejects: input.total,
+      }),
+    onAutoApprove: (input) =>
+      emit("auto-approve", {
+        kind: input.kind,
+        autoApproveSessionID: input.sessionID,
+        totalAutoApproves: input.total,
+      }),
+    // No JSON event for livelock warnings: the core already log.warn's at the
+    // same gate, and the operator-facing JSON contract historically (under the
+    // old RunEvents.emit) only emitted auto-reject/auto-approve. Keeping
+    // livelock log-only preserves that contract under F11 extraction.
+    onLivelockWarn: () => {},
+  }
+}
+
+/**
  * Reply to a `permission.asked` SSE event in attach mode.
  *
- * Coupling note: in non-attach mode `RunEvents.make` runs in-process alongside
- * `prompt.loop` and owns the auto-reply contract for the root session and its
- * descendants (it is *local* to this CLI process, not server-side). In attach
- * mode, the local CLI is just an SSE viewer of a remote opencode server, and
- * the remote server does not currently spin up its own RunEvents handler —
- * so this function is the only auto-responder for permission asks visible to
- * the local user. If a future change makes the remote server attach-aware
- * (i.e., it runs its own RunEvents per attached client), this helper becomes
- * a redundant double-responder and must be removed (along with the dispatch
- * in `dispatchPermissionAsked` and its call site in run.ts's SSE loop).
+ * Coupling note: in non-attach mode `SessionAutoReply.make` runs in-process
+ * alongside `prompt.loop` and owns the auto-reply contract for the root
+ * session and its descendants (it is *local* to this CLI process, not
+ * server-side). In attach mode, the local CLI is just an SSE viewer of a
+ * remote opencode server, and the remote server does not currently spin up
+ * its own auto-reply handler — so this function is the only auto-responder
+ * for permission asks visible to the local user. If a future change makes
+ * the remote server attach-aware (i.e., it runs its own auto-reply per
+ * attached client), this helper becomes a redundant double-responder and
+ * must be removed (along with the dispatch in `dispatchPermissionAsked` and
+ * its call site in run.ts's SSE loop).
  *
  * Behavior matrix for attach mode:
  * - skipPermissions=true → reply "once" (silent; symmetric with auto-approve flow)
@@ -235,8 +288,8 @@ function normalizePath(input?: string) {
  *
  * Followup (non-blocking): attach + jsonMode silently auto-rejects without
  * emitting an `auto-reject` JSON event (non-attach mode emits one via
- * RunEvents). Reaching parity would require either an attach-side JSON
- * emitter here or moving JSON emission into a sink that both modes share.
+ * SessionAutoReply's sink). Reaching parity would require either an
+ * attach-side JSON emitter here or routing both modes through the same sink.
  * Out of scope for F10 (which only collapses the dual permission paths).
  *
  * Each invocation produces exactly one `sdk.permission.reply` call. Caller
@@ -273,9 +326,9 @@ export async function replyPermissionAttachMode(input: {
 
 /**
  * Dispatch a `permission.asked` SSE event to either the no-op-with-log path
- * (non-attach: `runEventsHandle` is set, in-process RunEvents owns the reply)
- * or the attach-mode reply path (`runEventsHandle` is null, this client must
- * reply via SDK).
+ * (non-attach: `runEventsHandle` is set, in-process SessionAutoReply owns the
+ * reply) or the attach-mode reply path (`runEventsHandle` is null, this
+ * client must reply via SDK).
  *
  * Exported for unit-test access only — the call site is `run.ts`'s SSE loop.
  * Keeping it exported gives the F10 dual-path invariant a testable seam without
@@ -283,7 +336,7 @@ export async function replyPermissionAttachMode(input: {
  *
  * Invariant: `hasRunEventsHandle === !args.attach` (enforced at the
  * `runEventsHandle` ternary in run.ts; see comment near construction). If that
- * invariant ever drifts — e.g. attach mode also gets a server-side RunEvents
+ * invariant ever drifts — e.g. attach mode also gets a server-side auto-reply
  * — the dual-responder race F10 was raised against returns. The unit tests
  * for this dispatch pin the contract: at most one `sdk.permission.reply` per
  * `permission.asked` event.
@@ -308,10 +361,10 @@ export async function dispatchPermissionAsked(input: {
   if (input.permission.sessionID !== input.sessionID) return false
 
   if (input.hasRunEventsHandle) {
-    // Non-attach mode: in-process RunEvents owns the auto-reply contract;
-    // here we only surface a UI line (skipped under dangerously-skip-permissions
-    // and under jsonMode, where the matching auto-reject JSON event is emitted
-    // by RunEvents instead).
+    // Non-attach mode: in-process SessionAutoReply owns the auto-reply
+    // contract; here we only surface a UI line (skipped under
+    // dangerously-skip-permissions and under jsonMode, where the matching
+    // auto-reject JSON event is emitted by SessionAutoReply's sink instead).
     if (!input.skipPermissions && !input.jsonMode) {
       input.println(
         `permission requested: ${input.permission.permission} (${input.permission.patterns.join(", ")}); auto-rejecting`,
@@ -749,11 +802,13 @@ export const RunCommand = cmd({
       const runEventsHandle = args.attach
         ? null
         : await AppRuntime.runPromise(
-            RunEvents.make({
-              rootSessionID: sessionID,
-              skipPermissions: args["dangerously-skip-permissions"] === true,
-              jsonMode,
-            }),
+            SessionAutoReply.make(
+              {
+                rootSessionID: sessionID,
+                skipPermissions: args["dangerously-skip-permissions"] === true,
+              },
+              makeRunSink(jsonMode, sessionID),
+            ),
           )
 
       try {
