@@ -120,4 +120,27 @@ describe("cli/run makeRunSink", () => {
     const parsed = writes.map((w) => JSON.parse(w.trim()) as { type: string })
     expect(parsed.map((p) => p.type)).toEqual(["auto-reject", "auto-reject", "auto-approve"])
   })
+
+  // Sink contract requires callbacks not to throw, otherwise the auto-reply
+  // fiber would fail before its question.reject / permission.reply side
+  // effect runs. process.stdout.write throws EPIPE when a downstream
+  // consumer closes the pipe (e.g. `opencode run --output-format=json |
+  // head -1`). makeRunSink must swallow that to honor the contract.
+  test("jsonMode swallows EPIPE-style stdout.write throws (Sink contract)", () => {
+    const original = process.stdout.write.bind(process.stdout)
+    process.stdout.write = (() => {
+      throw Object.assign(new Error("write EPIPE"), { code: "EPIPE" })
+    }) as typeof process.stdout.write
+
+    try {
+      const sink = makeRunSink(true, ROOT)
+      // None of these calls should throw. If any propagates, the test fails
+      // via the thrown error and the SessionAutoReply contract is violated.
+      sink.onAutoReject({ kind: "question", sessionID: ROOT, total: 1 })
+      sink.onAutoApprove({ kind: "permission", sessionID: ROOT, total: 1 })
+      sink.onLivelockWarn({ rootSessionID: ROOT })
+    } finally {
+      process.stdout.write = original
+    }
+  })
 })

@@ -231,7 +231,17 @@ export function makeRunSink(jsonMode: boolean, rootSessionID: SessionID): AutoRe
   // the right object — reuse it instead of duplicating the shape.
   if (!jsonMode) return silentAutoReplySink
   const emit = (type: string, data: Record<string, unknown>) => {
-    process.stdout.write(JSON.stringify({ type, timestamp: Date.now(), sessionID: rootSessionID, ...data }) + "\n")
+    // Sink contract requires callbacks not to throw (see Sink JSDoc in
+    // src/session/auto-reply/sink.ts). process.stdout.write can throw on
+    // EPIPE (downstream consumer closed the pipe), and JSON.stringify is
+    // safe today but defended against future shape changes. Swallow the
+    // failure so the auto-reply fiber's question.reject / permission.reply
+    // side effect still runs.
+    try {
+      process.stdout.write(JSON.stringify({ type, timestamp: Date.now(), sessionID: rootSessionID, ...data }) + "\n")
+    } catch {
+      // intentionally empty — see contract note above
+    }
   }
   return {
     onAutoReject: (input) =>
