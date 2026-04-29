@@ -383,12 +383,16 @@ export interface Interface {
    * accumulator: every confirmed descendant in the walked chain is added to
    * the set. The cache is auto-seeded with `root` on every call, so callers
    * can pass a fresh `new Set()` and reuse it across calls without seeding.
-   * Caches MUST NOT be shared across different roots — if a non-empty cache
-   * is passed that does not already contain `root`, the call dies with a
-   * clear error instead of returning silently-wrong results from another
-   * lineage's accumulated entries. Callers that issue many `isDescendantOf`
-   * calls against the same root (e.g. SessionAutoReply) should reuse one
-   * cache so the parent chain is traversed at most once per node.
+   *
+   * Cache reuse is only safe within a single root. As a partial guard, if a
+   * non-empty cache is passed that does not already contain `root`, the call
+   * dies — that case can only arise from a cache leaked from another lineage.
+   * The guard does NOT catch caches that have been mixed (root present plus
+   * entries from a different root); detecting that would require tagging the
+   * cache. Each `SessionAutoReply` instance owns its own cache, which is the
+   * intended usage. If you have a use case that needs disjoint roots to
+   * share a cache, build a `Map<root, Set<SessionID>>` outside this helper
+   * and pass the per-root inner Set.
    */
   readonly isDescendantOf: (
     sid: SessionID,
