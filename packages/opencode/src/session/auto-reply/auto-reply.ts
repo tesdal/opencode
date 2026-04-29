@@ -46,7 +46,10 @@ export const make = Effect.fn("SessionAutoReply.make")(function* (config: Config
     livelockWarned: false,
   }
 
-  const descendants = new Set<SessionID>([config.rootSessionID])
+  // Reused across calls so the parent walk is traversed at most once per
+  // descendant id. Session.isDescendantOf auto-seeds `rootSessionID` on every
+  // call, so an empty Set is the simplest seed.
+  const descendants = new Set<SessionID>()
 
   const isDescendant = (sid: SessionID) =>
     session.isDescendantOf(sid, config.rootSessionID, { maxDepth: MAX_LINEAGE_DEPTH, cache: descendants })

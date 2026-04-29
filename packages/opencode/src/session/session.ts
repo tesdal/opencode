@@ -381,10 +381,11 @@ export interface Interface {
    * stops at any `NotFoundError` (returns false). When `opts.cache` is
    * provided, it is used both as a positive-hit short-circuit and as an
    * accumulator: every confirmed descendant in the walked chain is added to
-   * the set. Callers that issue many `isDescendantOf` calls against the same
-   * root (e.g. SessionAutoReply) should seed the cache with `new Set([root])`
-   * and reuse it across calls so the parent chain is traversed at most once
-   * per node.
+   * the set. The cache is auto-seeded with `root` on every call, so callers
+   * can pass a fresh `new Set()` and reuse it across calls without seeding.
+   * Callers that issue many `isDescendantOf` calls against the same root
+   * (e.g. SessionAutoReply) should reuse one cache so the parent chain is
+   * traversed at most once per node.
    */
   readonly isDescendantOf: (
     sid: SessionID,
@@ -693,7 +694,13 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Storage.Service> =
       opts?: { maxDepth?: number; cache?: Set<SessionID> },
     ) {
       const maxDepth = opts?.maxDepth ?? 64
-      const known = opts?.cache ?? new Set<SessionID>([root])
+      const known = opts?.cache ?? new Set<SessionID>()
+      // Always seed `root` into the working set so the parent walk has a
+      // termination anchor regardless of whether the caller pre-seeded the
+      // cache. Without this, a caller-provided cache that happens to omit
+      // `root` would cause the walk to bottom out at a not-found parent and
+      // return false even for true descendants — a silent footgun.
+      known.add(root)
       if (sid === root) return true
       if (known.has(sid)) return true
       // Walk parent chain. Track the chain so we can promote every visited

@@ -296,4 +296,22 @@ describe("Session.isDescendantOf", () => {
       },
     })
   })
+
+  test("auto-seeds root into cache so callers can pass an empty Set", async () => {
+    await using tmp = await tmpdir({ git: true })
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const root = await create({ title: "root" })
+        const child = await create({ title: "child", parentID: root.id })
+        // Caller passes a fresh empty Set — root must still be reachable.
+        // Without the auto-seed in isDescendantOf this would walk past root,
+        // hit a not-found parent, and return false.
+        const cache = new Set<SessionID>()
+        expect(await isDescendantOf(child.id, root.id, { cache })).toBe(true)
+        expect(cache.has(root.id)).toBe(true)
+        await remove(root.id)
+      },
+    })
+  })
 })
