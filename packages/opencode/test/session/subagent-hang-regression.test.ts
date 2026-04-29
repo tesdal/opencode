@@ -4,20 +4,19 @@
 //      SSEStallError, which SessionRetry classifies as transport-retryable
 //      and surfaces as a `retry` SessionStatus. Gates against indefinite hangs.
 //   2. Subagent question in headless: Phase B's Question→Bus publish +
-//      Question.reject→Deferred.fail contract must allow an external
-//      subscriber (mirroring SessionAutoReply) to unblock a subagent question tool.
-//      Gates against headless deadlock when the user can't answer.
+//      Question.reject→Deferred.fail contract must allow SessionAutoReply
+//      to unblock a subagent question tool. Gates against headless deadlock
+//      when the user can't answer.
 
 import { expect } from "bun:test"
 import { Effect, Exit, Fiber } from "effect"
-import { Bus } from "../../src/bus"
-import { Permission } from "../../src/permission"
 import { ModelID, ProviderID } from "../../src/provider/schema"
-import { Question } from "../../src/question"
 import { Session } from "../../src/session"
 import { SessionPrompt } from "../../src/session/prompt"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionStatus } from "../../src/session/status"
+import { SessionAutoReply } from "../../src/session/auto-reply/auto-reply"
+import { AutoReplySink } from "../../src/session/auto-reply/sink"
 import { Log } from "../../src/util"
 import { provideTmpdirServer } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
@@ -161,9 +160,6 @@ it.live(
       Effect.fnUntraced(function* (input) {
         const prompt = yield* SessionPrompt.Service
         const sessions = yield* Session.Service
-        const bus = yield* Bus.Service
-        const question = yield* Question.Service
-        const permission = yield* Permission.Service
         const sessionStatus = yield* SessionStatus.Service
 
         // Reply 1 (root): dispatch the task tool to spawn a subagent.
@@ -172,9 +168,9 @@ it.live(
           prompt: "use the question tool to ask the user",
           subagent_type: "general",
         })
-        // Reply 2 (subagent): call the question tool. Our bus subscriber
-        // mirrors the SessionAutoReply contract and rejects this question, which
-        // unblocks the subagent's question tool with RejectedError.
+        // Reply 2 (subagent): call the question tool. SessionAutoReply
+        // (subscribed below) rejects this question, which unblocks the
+        // subagent's question tool with RejectedError.
         yield* input.llm.tool("question", {
           questions: [
             {
@@ -201,36 +197,16 @@ it.live(
         })
         yield* user(chat.id, "please ask something")
 
-        // Mirror of SessionAutoReply.make semantics (see src/session/auto-reply/auto-reply.ts):
-        // reject any question or permission raised on a descendant of the
-        // root session. This test is a single root with one subagent, so we
-        // reject indiscriminately — the production handler does parent-chain
-        // lineage checks which are orthogonal to the hang contract.
-        let questionsRejected = 0
-        yield* Effect.acquireRelease(
-          Effect.gen(function* () {
-            const unsubQuestion = yield* bus.subscribeCallback(Question.Event.Asked, (event) =>
-              Effect.runPromise(
-                Effect.gen(function* () {
-                  questionsRejected += 1
-                  yield* question.reject(event.properties.id)
-                }),
-              ),
-            )
-            const unsubPermission = yield* bus.subscribeCallback(Permission.Event.Asked, (event) =>
-              Effect.runPromise(
-                Effect.gen(function* () {
-                  yield* permission.reply({ requestID: event.properties.id, reply: "reject" })
-                }),
-              ),
-            )
-            return { unsubQuestion, unsubPermission }
-          }),
-          (handles) =>
-            Effect.sync(() => {
-              handles.unsubQuestion()
-              handles.unsubPermission()
-            }),
+        // F12: use the real production auto-reply path. Previously this
+        // test mirrored SessionAutoReply's contract inline via manual
+        // bus.subscribeCallback handlers, which made the test a regression
+        // gate for the *concept* (a subscriber that rejects descendants)
+        // rather than for the *integration* between SessionAutoReply and
+        // SessionPrompt.loop. Now any drift in the production auto-reply
+        // implementation will fail this regression test directly.
+        const autoReplyHandle = yield* Effect.acquireRelease(
+          SessionAutoReply.make({ rootSessionID: chat.id, skipPermissions: false }, AutoReplySink.silentSink),
+          (handle) => Effect.sync(() => handle.unsubscribe()),
         )
 
         const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
@@ -248,8 +224,8 @@ it.live(
         expect(Exit.isSuccess(exit)).toBe(true)
 
         // Phase B contract: the subagent's question tool must have been
-        // rejected at least once via the bus subscriber.
-        expect(questionsRejected).toBeGreaterThanOrEqual(1)
+        // rejected at least once via SessionAutoReply.
+        expect(autoReplyHandle.stats.autoRejectedQuestions).toBeGreaterThanOrEqual(1)
 
         // The rejection must propagate into the subagent's tool output so
         // the parent (task tool) sees the failure. Walk the root + child
