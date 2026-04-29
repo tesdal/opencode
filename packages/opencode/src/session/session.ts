@@ -383,9 +383,12 @@ export interface Interface {
    * accumulator: every confirmed descendant in the walked chain is added to
    * the set. The cache is auto-seeded with `root` on every call, so callers
    * can pass a fresh `new Set()` and reuse it across calls without seeding.
-   * Callers that issue many `isDescendantOf` calls against the same root
-   * (e.g. SessionAutoReply) should reuse one cache so the parent chain is
-   * traversed at most once per node.
+   * Caches MUST NOT be shared across different roots — if a non-empty cache
+   * is passed that does not already contain `root`, the call dies with a
+   * clear error instead of returning silently-wrong results from another
+   * lineage's accumulated entries. Callers that issue many `isDescendantOf`
+   * calls against the same root (e.g. SessionAutoReply) should reuse one
+   * cache so the parent chain is traversed at most once per node.
    */
   readonly isDescendantOf: (
     sid: SessionID,
@@ -695,11 +698,20 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Storage.Service> =
     ) {
       const maxDepth = opts?.maxDepth ?? 64
       const known = opts?.cache ?? new Set<SessionID>()
+      // Defend against accidental cache sharing across different roots: if a
+      // caller passes a non-empty cache that lacks `root`, those entries were
+      // populated under a different lineage and `known.has(sid)` could
+      // short-circuit to true with the wrong answer. Fail loudly instead of
+      // returning a silently wrong result.
+      if (known.size > 0 && !known.has(root)) {
+        return yield* Effect.die(
+          new Error(
+            `Session.isDescendantOf: opts.cache appears to belong to a different root (size=${known.size}, missing root=${root}). Caches must not be shared across roots.`,
+          ),
+        )
+      }
       // Always seed `root` into the working set so the parent walk has a
-      // termination anchor regardless of whether the caller pre-seeded the
-      // cache. Without this, a caller-provided cache that happens to omit
-      // `root` would cause the walk to bottom out at a not-found parent and
-      // return false even for true descendants — a silent footgun.
+      // termination anchor and the next cross-root reuse check still works.
       known.add(root)
       if (sid === root) return true
       if (known.has(sid)) return true

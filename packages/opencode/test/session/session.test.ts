@@ -305,12 +305,37 @@ describe("Session.isDescendantOf", () => {
         const root = await create({ title: "root" })
         const child = await create({ title: "child", parentID: root.id })
         // Caller passes a fresh empty Set — root must still be reachable.
-        // Without the auto-seed in isDescendantOf this would walk past root,
-        // hit a not-found parent, and return false.
+        // Without the auto-seed in isDescendantOf this would walk past root
+        // (since `known.has(root)` would be false), bottom out at the
+        // not-found parent of root, and return false.
         const cache = new Set<SessionID>()
         expect(await isDescendantOf(child.id, root.id, { cache })).toBe(true)
         expect(cache.has(root.id)).toBe(true)
         await remove(root.id)
+      },
+    })
+  })
+
+  test("dies if cache is non-empty but missing root (cross-root reuse guard)", async () => {
+    await using tmp = await tmpdir({ git: true })
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const rootA = await create({ title: "rootA" })
+        const rootB = await create({ title: "rootB" })
+        const childA = await create({ title: "childA", parentID: rootA.id })
+        // Populate a cache under rootA, then incorrectly try to reuse it
+        // against rootB. The guard must reject this loudly.
+        const cache = new Set<SessionID>()
+        expect(await isDescendantOf(childA.id, rootA.id, { cache })).toBe(true)
+        // cache now contains {rootA, childA} but not rootB.
+        let died = false
+        await isDescendantOf(rootA.id, rootB.id, { cache }).catch(() => {
+          died = true
+        })
+        expect(died).toBe(true)
+        await remove(rootA.id)
+        await remove(rootB.id)
       },
     })
   })
