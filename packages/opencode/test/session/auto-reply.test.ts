@@ -257,15 +257,25 @@ describe("session/auto-reply", () => {
       }
       void validConfig
 
-      const invalidConfig: SessionAutoReply.Config = {
+      // Two excess-property fields are intentionally invalid here. We pin
+      // each one with its own ts-expect-error so the test continues to fail
+      // if either field is accidentally added back to Config (or if TS's
+      // excess-property error reporting changes its first-error-only behavior).
+      const invalidWithAttach: SessionAutoReply.Config = {
         rootSessionID: SessionID.make("ses_root_cfg_0000000000000000001"),
         skipPermissions: false,
-        // @ts-expect-error attach mode is represented by not creating SessionAutoReply,
-        // and jsonMode is now a caller (run.ts) sink concern, not core config
+        // @ts-expect-error attach mode is represented by not creating SessionAutoReply
         attach: true,
+      }
+      void invalidWithAttach
+
+      const invalidWithJsonMode: SessionAutoReply.Config = {
+        rootSessionID: SessionID.make("ses_root_cfg_0000000000000000002"),
+        skipPermissions: false,
+        // @ts-expect-error jsonMode is now a caller (run.ts) sink concern, not core config
         jsonMode: true,
       }
-      void invalidConfig
+      void invalidWithJsonMode
     }),
   )
 

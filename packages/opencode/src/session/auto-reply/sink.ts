@@ -10,6 +10,14 @@ import type { SessionID } from "../schema"
  * Each method is fire-and-forget — synchronous, no return value. Implementations
  * that need async work (network emit, etc.) should fire-and-forget internally;
  * the bus dispatch path can not block on emission.
+ *
+ * **Contract: callbacks must not throw.** Sink invocations happen inside the
+ * auto-reply fiber *before* the `question.reject` / `permission.reply` side
+ * effects. A throwing sink would fail the fiber and skip the side effect, so
+ * the auto-reply contract (subagent always gets a response) would silently
+ * break. If a sink target can fail (closed pipe, network error, full disk),
+ * the implementation must catch the failure internally and either drop the
+ * event or buffer it. The core does not wrap callbacks in try/catch.
  */
 export type Sink = {
   readonly onAutoReject: (input: {
