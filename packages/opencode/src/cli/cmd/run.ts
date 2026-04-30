@@ -256,6 +256,124 @@ export function makeRunSink(jsonMode: boolean, rootSessionID: SessionID): AutoRe
   }
 }
 
+/**
+ * Reply to a `permission.asked` SSE event in attach mode.
+ *
+ * Coupling note: in non-attach mode `SessionAutoReply.make` runs in-process
+ * alongside `prompt.loop` and owns the auto-reply contract for the root
+ * session and its descendants (it is *local* to this CLI process, not
+ * server-side). In attach mode, the local CLI is just an SSE viewer of a
+ * remote opencode server, and the remote server does not currently spin up
+ * its own auto-reply handler — so this function is the only auto-responder
+ * for permission asks visible to the local user. If a future change makes
+ * the remote server attach-aware (i.e., it runs its own auto-reply per
+ * attached client), this helper becomes a redundant double-responder and
+ * must be removed (along with the dispatch in `dispatchPermissionAsked` and
+ * its call site in run.ts's SSE loop).
+ *
+ * Behavior matrix for attach mode:
+ * - skipPermissions=true → reply "once" (silent; symmetric with auto-approve flow)
+ * - skipPermissions=false, jsonMode=false → log + reply "reject"
+ * - skipPermissions=false, jsonMode=true → reply "reject" without UI or JSON
+ *   emission (no parity with non-attach `auto-reject` JSON event today; attach
+ *   mode has no equivalent emitter — see followup note below)
+ *
+ * Followup (non-blocking): attach + jsonMode silently auto-rejects without
+ * emitting an `auto-reject` JSON event (non-attach mode emits one via
+ * SessionAutoReply's sink). Reaching parity would require either an
+ * attach-side JSON emitter here or routing both modes through the same sink.
+ * Out of scope for F10 (which only collapses the dual permission paths).
+ *
+ * Each invocation produces exactly one `sdk.permission.reply` call. Caller
+ * `dispatchPermissionAsked` invokes this exactly once per `permission.asked`
+ * SSE event matching the active sessionID.
+ */
+type PermissionReplyClient = {
+  readonly permission: {
+    readonly reply: (input: { requestID: string; reply: "once" | "always" | "reject" }) => Promise<unknown>
+  }
+}
+
+export async function replyPermissionAttachMode(input: {
+  sdk: PermissionReplyClient
+  permission: { id: string; permission: string; patterns: readonly string[] }
+  skipPermissions: boolean
+  jsonMode: boolean
+  println: (message: string) => void
+}): Promise<void> {
+  if (input.skipPermissions) {
+    await input.sdk.permission.reply({ requestID: input.permission.id, reply: "once" })
+    return
+  }
+  if (!input.jsonMode) {
+    input.println(
+      `permission requested: ${input.permission.permission} (${input.permission.patterns.join(", ")}); auto-rejecting`,
+    )
+  }
+  await input.sdk.permission.reply({ requestID: input.permission.id, reply: "reject" })
+}
+
+/**
+ * Dispatch a `permission.asked` SSE event to either the no-op-with-log path
+ * (non-attach: `hasInProcessAutoReply` is true, in-process SessionAutoReply
+ * owns the reply) or the attach-mode reply path (`hasInProcessAutoReply` is
+ * false, this client must reply via SDK).
+ *
+ * Exported for unit-test access only — the call site is `run.ts`'s SSE loop.
+ * Keeping it exported gives the F10 dual-path invariant a testable seam without
+ * having to drive the whole CLI.
+ *
+ * Invariant: `hasInProcessAutoReply === !args.attach` (enforced where the
+ * `hasInProcessAutoReply` flag is plumbed through `execute()` — set to `true`
+ * at the non-attach call site and `false` at the attach call site). If that
+ * invariant ever drifts — e.g. attach mode also gets a server-side auto-reply
+ * — the dual-responder race F10 was raised against returns. The unit tests
+ * for this dispatch pin the contract: at most one `sdk.permission.reply` per
+ * `permission.asked` event.
+ *
+ * Returns true if the event was for this session (and was therefore handled),
+ * false if filtered out by sessionID mismatch.
+ */
+export async function dispatchPermissionAsked(input: {
+  permission: { id: string; sessionID: string; permission: string; patterns: readonly string[] }
+  // sessionID is the active session for this run. Typed as `string | undefined`
+  // because the call site closure (run.ts's `loop()`) is declared before the
+  // null guard on `await session(sdk)`. At runtime sessionID is always defined
+  // (process.exit(1) on the null branch); a stray undefined value here would
+  // simply filter out all events, which is safe-by-default.
+  sessionID: string | undefined
+  hasInProcessAutoReply: boolean
+  sdk: PermissionReplyClient
+  skipPermissions: boolean
+  jsonMode: boolean
+  println: (message: string) => void
+}): Promise<boolean> {
+  if (input.permission.sessionID !== input.sessionID) return false
+
+  if (input.hasInProcessAutoReply) {
+    // Non-attach mode: in-process SessionAutoReply owns the auto-reply
+    // contract; here we only surface a UI line (skipped under
+    // dangerously-skip-permissions and under jsonMode, where the matching
+    // auto-reject JSON event is emitted by SessionAutoReply's sink instead).
+    if (!input.skipPermissions && !input.jsonMode) {
+      input.println(
+        `permission requested: ${input.permission.permission} (${input.permission.patterns.join(", ")}); auto-rejecting`,
+      )
+    }
+    return true
+  }
+
+  // Attach mode: see replyPermissionAttachMode coupling note.
+  await replyPermissionAttachMode({
+    sdk: input.sdk,
+    permission: input.permission,
+    skipPermissions: input.skipPermissions,
+    jsonMode: input.jsonMode,
+    println: input.println,
+  })
+  return true
+}
+
 export const RunCommand = cmd({
   command: "run [message..]",
   describe: "run opencode with a message",
@@ -583,32 +701,15 @@ export const RunCommand = cmd({
           }
 
           if (event.type === "permission.asked") {
-            const permission = event.properties
-            if (permission.sessionID !== sessionID) continue
-
-            if (args["dangerously-skip-permissions"]) {
-              // In non-attach mode, in-process SessionAutoReply owns the
-              // reply contract — calling sdk.permission.reply here would
-              // race with it. Only the attach-mode SSE viewer must reply.
-              if (!hasInProcessAutoReply) {
-                await sdk.permission.reply({
-                  requestID: permission.id,
-                  reply: "once",
-                })
-              }
-              continue
-            }
-            UI.println(
-              UI.Style.TEXT_WARNING_BOLD + "!",
-              UI.Style.TEXT_NORMAL +
-                `permission requested: ${permission.permission} (${permission.patterns.join(", ")}); auto-rejecting`,
-            )
-            if (!hasInProcessAutoReply) {
-              await sdk.permission.reply({
-                requestID: permission.id,
-                reply: "reject",
-              })
-            }
+            await dispatchPermissionAsked({
+              permission: event.properties,
+              sessionID,
+              hasInProcessAutoReply,
+              sdk,
+              skipPermissions: args["dangerously-skip-permissions"] ?? false,
+              jsonMode: args.format === "json",
+              println: (msg) => UI.println(UI.Style.TEXT_WARNING_BOLD + "!", UI.Style.TEXT_NORMAL + msg),
+            })
           }
         }
       }
