@@ -201,6 +201,13 @@ export type ApiError = {
   }
 }
 
+export type SseStallError = {
+  name: "SSEStallError"
+  data: {
+    message: string
+  }
+}
+
 export type EventSessionError = {
   type: "session.error"
   properties: {
@@ -213,6 +220,7 @@ export type EventSessionError = {
       | StructuredOutputError
       | ContextOverflowError
       | ApiError
+      | SseStallError
   }
 }
 
@@ -595,6 +603,7 @@ export type AssistantMessage = {
     | StructuredOutputError
     | ContextOverflowError
     | ApiError
+    | SseStallError
   parentID: string
   modelID: string
   providerID: string

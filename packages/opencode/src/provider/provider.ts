@@ -28,6 +28,7 @@ import { withStatics } from "@/util/schema"
 
 import * as ProviderTransform from "./transform"
 import { ModelID, ProviderID } from "./schema"
+import { MessageV2 } from "@/session/message-v2"
 
 const log = Log.create({ service: "provider" })
 
@@ -47,7 +48,9 @@ function wrapSSE(res: Response, ms: number, ctl: AbortController) {
     async pull(ctrl) {
       const part = await new Promise<Awaited<ReturnType<typeof reader.read>>>((resolve, reject) => {
         const id = setTimeout(() => {
-          const err = new Error("SSE read timed out")
+          // The "SSE read timed out after Nms" message format is also the cross-realm
+          // identity fallback in MessageV2.SSE_STALL_MESSAGE_RE — keep these in sync.
+          const err = new MessageV2.SSEStallError({ message: `SSE read timed out after ${ms}ms` })
           ctl.abort(err)
           void reader.cancel(err)
           reject(err)
