@@ -13,9 +13,20 @@ export const RETRY_INITIAL_DELAY = 2000
 export const RETRY_BACKOFF_FACTOR = 2
 export const RETRY_MAX_DELAY_NO_HEADERS = 30_000 // 30 seconds
 export const RETRY_MAX_DELAY = 2_147_483_647 // max 32-bit signed integer for setTimeout
+export const TRANSPORT_RETRY_CAP = 5
+
+const TRANSPORT_PATTERNS = ["ETIMEDOUT", "ECONNRESET", "ECONNREFUSED", "EAI_AGAIN", "socket hang up"]
 
 function cap(ms: number) {
   return Math.min(ms, RETRY_MAX_DELAY)
+}
+
+function transportMessage(error: Err) {
+  if (MessageV2.SSEStallError.isInstance(error)) return error.data.message
+  const msg = error.data?.message
+  if (typeof msg !== "string") return undefined
+  if (!TRANSPORT_PATTERNS.some((pattern) => msg.includes(pattern))) return undefined
+  return msg
 }
 
 export function delay(attempt: number, error?: MessageV2.APIError) {
@@ -51,7 +62,12 @@ export function delay(attempt: number, error?: MessageV2.APIError) {
   return cap(Math.min(RETRY_INITIAL_DELAY * Math.pow(RETRY_BACKOFF_FACTOR, attempt - 1), RETRY_MAX_DELAY_NO_HEADERS))
 }
 
-export function retryable(error: Err) {
+// Branch order matches legacy retryable(): ContextOverflow -> APIError -> plain-text
+// rate-limit -> transport -> JSON. An error message like "rate limit exceeded
+// (ETIMEDOUT during retry)" must stay classified as rate-limit (not transport)
+// for message semantics, but we still honor TRANSPORT_RETRY_CAP via isTransport
+// when the message also matches a transport pattern.
+export function classify(error: Err) {
   // context overflow errors should not be retried
   if (MessageV2.ContextOverflowError.isInstance(error)) return undefined
   if (MessageV2.APIError.isInstance(error)) {
@@ -59,9 +75,15 @@ export function retryable(error: Err) {
     // 5xx errors are transient server failures and should always be retried,
     // even when the provider SDK doesn't explicitly mark them as retryable.
     if (!error.data.isRetryable && !(status !== undefined && status >= 500)) return undefined
-    if (error.data.responseBody?.includes("FreeUsageLimitError")) return GO_UPSELL_MESSAGE
-    return error.data.message.includes("Overloaded") ? "Provider is overloaded" : error.data.message
+    if (error.data.responseBody?.includes("FreeUsageLimitError")) {
+      return { message: GO_UPSELL_MESSAGE }
+    }
+    return {
+      message: error.data.message.includes("Overloaded") ? "Provider is overloaded" : error.data.message,
+    }
   }
+
+  const transport = transportMessage(error)
 
   // Check for rate limit patterns in plain text error messages
   const msg = error.data?.message
@@ -72,9 +94,12 @@ export function retryable(error: Err) {
       lower.includes("rate limit") ||
       lower.includes("too many requests")
     ) {
-      return msg
+      if (transport) return { message: msg, isTransport: true as const }
+      return { message: msg }
     }
   }
+
+  if (transport) return { message: transport, isTransport: true as const }
 
   const json = iife(() => {
     try {
@@ -92,15 +117,20 @@ export function retryable(error: Err) {
   const code = typeof json.code === "string" ? json.code : ""
 
   if (json.type === "error" && json.error?.type === "too_many_requests") {
-    return "Too Many Requests"
+    return { message: "Too Many Requests" }
   }
   if (code.includes("exhausted") || code.includes("unavailable")) {
-    return "Provider is overloaded"
+    return { message: "Provider is overloaded" }
   }
   if (json.type === "error" && typeof json.error?.code === "string" && json.error.code.includes("rate_limit")) {
-    return "Rate Limited"
+    return { message: "Rate Limited" }
   }
   return undefined
+}
+
+// Kept to avoid churning the existing retry.test.ts suite. Prefer classify() in new code.
+export function retryable(error: Err) {
+  return classify(error)?.message
 }
 
 export function policy(opts: {
@@ -110,12 +140,15 @@ export function policy(opts: {
   return Schedule.fromStepWithMetadata(
     Effect.succeed((meta: Schedule.InputMetadata<unknown>) => {
       const error = opts.parse(meta.input)
-      const message = retryable(error)
-      if (!message) return Cause.done(meta.attempt)
+      const c = classify(error)
+      if (!c) return Cause.done(meta.attempt)
+      if (c.isTransport && !MessageV2.APIError.isInstance(error) && meta.attempt > TRANSPORT_RETRY_CAP) {
+        return Cause.done(meta.attempt)
+      }
       return Effect.gen(function* () {
         const wait = delay(meta.attempt, MessageV2.APIError.isInstance(error) ? error : undefined)
         const now = yield* Clock.currentTimeMillis
-        yield* opts.set({ attempt: meta.attempt, message, next: now + wait })
+        yield* opts.set({ attempt: meta.attempt, message: c.message, next: now + wait })
         return [meta.attempt, Duration.millis(wait)] as [number, Duration.Duration]
       })
     }),
