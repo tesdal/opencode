@@ -57,6 +57,9 @@ export const APIError = namedSchemaError("APIError", {
   metadata: Schema.optional(Schema.Record(Schema.String, Schema.String)),
 })
 export type APIError = z.infer<typeof APIError.Schema>
+export const SSEStallError = namedSchemaError("SSEStallError", {
+  message: Schema.String,
+})
 export const ContextOverflowError = namedSchemaError("ContextOverflowError", {
   message: Schema.String,
   responseBody: Schema.optional(Schema.String),
@@ -455,6 +458,7 @@ const AssistantErrorZod = z.discriminatedUnion("name", [
   StructuredOutputError.Schema,
   ContextOverflowError.Schema,
   APIError.Schema,
+  SSEStallError.Schema,
 ])
 type AssistantError = z.infer<typeof AssistantErrorZod>
 
@@ -469,6 +473,7 @@ const AssistantErrorSchema = Schema.Union([
   StructuredOutputError.EffectSchema,
   ContextOverflowError.EffectSchema,
   APIError.EffectSchema,
+  SSEStallError.EffectSchema,
 ]).annotate({ discriminator: "name" })
 
 // ── Prompt input schemas ─────────────────────────────────────────────────────
@@ -1103,6 +1108,46 @@ export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: Ses
   return filterCompacted(stream(sessionID))
 })
 
+// Message-based exact-match fallback for the wrapSSE() emission format.
+// The primary signals are `name === "SSEStallError"` and `_tag === "SSEStallError"`;
+// this regex only matches when that structured error identity is stripped during
+// cross-realm rethrow.
+const SSE_STALL_MESSAGE_RE = /^SSE read timed out after \d+ms$/
+
+function hasSSEStallCause(e: unknown, depth = 0): boolean {
+  if (depth > 8) return false
+  if (!e || typeof e !== "object") return false
+  const err = e as { name?: string; _tag?: string; message?: string; cause?: unknown }
+  if (err.name === "SSEStallError" || err._tag === "SSEStallError") return true
+  if (typeof err.message === "string" && SSE_STALL_MESSAGE_RE.test(err.message)) return true
+  if (err.cause) return hasSSEStallCause(err.cause, depth + 1)
+  return false
+}
+
+// Extract the user-meaningful "SSE read timed out after Nms" string from an
+// error that hasSSEStallCause matched. NamedSchemaError sets Error.prototype.message
+// to the tag (`super(tag, options)` in named-schema-error.ts), so an in-process
+// throw of MessageV2.SSEStallError caught and passed back through fromError must
+// read `.data.message`, not `.message`, to recover the timing text. Plain Error
+// instances (legacy or cross-realm) put it in `.message`. Walk the cause chain
+// so nested wrappers still produce the original timing text.
+function extractStallMessage(e: unknown, depth = 0): string {
+  if (depth > 8) return String(e)
+  if (!e || typeof e !== "object") return String(e)
+  const err = e as { data?: { message?: unknown }; message?: unknown; cause?: unknown }
+  if (err.data && typeof err.data.message === "string" && SSE_STALL_MESSAGE_RE.test(err.data.message)) {
+    return err.data.message
+  }
+  if (typeof err.message === "string" && SSE_STALL_MESSAGE_RE.test(err.message)) return err.message
+  if (err.cause) return extractStallMessage(err.cause, depth + 1)
+  // hasSSEStallCause already matched; produce best-effort text even if no node
+  // has the canonical "after Nms" timing format (e.g., test fixture passes
+  // "SSE read timed out" without the suffix).
+  if (err.data && typeof err.data.message === "string") return err.data.message
+  if (typeof err.message === "string") return err.message
+  return String(e)
+}
+
 export function fromError(
   e: unknown,
   ctx: { providerID: ProviderID; aborted?: boolean },
@@ -1152,6 +1197,11 @@ export function fromError(
           },
         },
         { cause: e },
+      ).toObject()
+    case hasSSEStallCause(e):
+      return new SSEStallError(
+        { message: extractStallMessage(e) },
+        { cause: e instanceof Error ? e : undefined },
       ).toObject()
     case APICallError.isInstance(e):
       const parsed = ProviderError.parseAPICallError({
