@@ -430,6 +430,30 @@ export interface Interface {
     sessionID: SessionID,
     predicate: (msg: MessageV2.WithParts) => boolean,
   ) => Effect.Effect<Option.Option<MessageV2.WithParts>>
+  /**
+   * Returns true when `sid` is `root` or any descendant of `root` via
+   * `parentID`. Walks the parent chain up to `opts.maxDepth` (default 64) and
+   * stops at any `NotFoundError` (returns false). When `opts.cache` is
+   * provided, it is used both as a positive-hit short-circuit and as an
+   * accumulator: every confirmed descendant in the walked chain is added to
+   * the set. The cache is auto-seeded with `root` on every call, so callers
+   * can pass a fresh `new Set()` and reuse it across calls without seeding.
+   *
+   * Cache reuse is only safe within a single root. As a partial guard, if a
+   * non-empty cache is passed that does not already contain `root`, the call
+   * dies — that case can only arise from a cache leaked from another lineage.
+   * The guard does NOT catch caches that have been mixed (root present plus
+   * entries from a different root); detecting that would require tagging the
+   * cache. Each `SessionAutoReply` instance owns its own cache, which is the
+   * intended usage. If you have a use case that needs disjoint roots to
+   * share a cache, build a `Map<root, Set<SessionID>>` outside this helper
+   * and pass the per-root inner Set.
+   */
+  readonly isDescendantOf: (
+    sid: SessionID,
+    root: SessionID,
+    opts?: { maxDepth?: number; cache?: Set<SessionID> },
+  ) => Effect.Effect<boolean>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Session") {}
@@ -734,6 +758,54 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Storage.Service> =
       return Option.none<MessageV2.WithParts>()
     })
 
+    const isDescendantOf = Effect.fn("Session.isDescendantOf")(function* (
+      sid: SessionID,
+      root: SessionID,
+      opts?: { maxDepth?: number; cache?: Set<SessionID> },
+    ) {
+      const maxDepth = opts?.maxDepth ?? 64
+      const known = opts?.cache ?? new Set<SessionID>()
+      // Defend against accidental cache sharing across different roots: if a
+      // caller passes a non-empty cache that lacks `root`, those entries were
+      // populated under a different lineage and `known.has(sid)` could
+      // short-circuit to true with the wrong answer. Fail loudly instead of
+      // returning a silently wrong result.
+      if (known.size > 0 && !known.has(root)) {
+        return yield* Effect.die(
+          new Error(
+            `Session.isDescendantOf: opts.cache appears to belong to a different root (size=${known.size}, missing root=${root}). Caches must not be shared across roots.`,
+          ),
+        )
+      }
+      // Always seed `root` into the working set so the parent walk has a
+      // termination anchor and the next cross-root reuse check still works.
+      known.add(root)
+      if (sid === root) return true
+      if (known.has(sid)) return true
+      // Walk parent chain. Track the chain so we can promote every visited
+      // node into the cache once we hit a known descendant — turns repeated
+      // calls against the same lineage into O(1) after the first walk.
+      const chain: SessionID[] = []
+      let cur: SessionID | undefined = sid
+      let depth = 0
+      while (cur !== undefined && !known.has(cur) && depth < maxDepth) {
+        chain.push(cur)
+        depth++
+        const lookup: Option.Option<Info> = yield* get(cur).pipe(
+          Effect.option,
+          Effect.catchDefect((defect) => {
+            if (!NotFoundError.isInstance(defect)) return Effect.die(defect)
+            return Effect.succeed(Option.none<Info>())
+          }),
+        )
+        if (Option.isNone(lookup)) break
+        cur = lookup.value.parentID ?? undefined
+      }
+      if (cur === undefined || !known.has(cur)) return false
+      chain.forEach((item) => known.add(item))
+      return true
+    })
+
     return Service.of({
       create,
       fork,
@@ -756,6 +828,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Storage.Service> =
       getPart,
       updatePartDelta,
       findMessage,
+      isDescendantOf,
     })
   }),
 )
