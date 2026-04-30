@@ -26,6 +26,9 @@ import { BashTool } from "../../tool/bash"
 import { TodoWriteTool } from "../../tool/todo"
 import { Locale } from "@/util/locale"
 import { AppRuntime } from "@/effect/app-runtime"
+import { SessionAutoReply } from "@/session/auto-reply/auto-reply"
+import { silentSink as silentAutoReplySink, type Sink as AutoReplySink } from "@/session/auto-reply/sink"
+import { SessionID } from "@/session/schema"
 
 type ToolProps<T> = {
   input: Tool.InferParameters<T>
@@ -202,6 +205,57 @@ function normalizePath(input?: string) {
   return input
 }
 
+/**
+ * Build the auto-reply Sink for `opencode run`. Decouples emission policy
+ * (stdout JSON when jsonMode, no-op otherwise) from the auto-reply core in
+ * `src/session/auto-reply/`. ACP/TUI/daemon will provide their own sinks
+ * routing to their own transports — see TODO(auto-reply-acp) in auto-reply.ts.
+ *
+ * Exported for unit-test access only — operators rely on the JSON shape
+ * (`autoRejectSessionID`/`totalAutoRejects`/etc) emitted under jsonMode, so
+ * this builder pins that external CLI contract independently of the sink
+ * callback signature.
+ */
+export function makeRunSink(jsonMode: boolean, rootSessionID: SessionID): AutoReplySink {
+  // The non-jsonMode case has no UI side: the SSE permission handler prints
+  // the per-event UI line, livelock warnings already log via the core
+  // log.warn, and stats counters live on the returned Handle. silentSink is
+  // the right object — reuse it instead of duplicating the shape.
+  if (!jsonMode) return silentAutoReplySink
+  const emit = (type: string, data: Record<string, unknown>) => {
+    // Sink contract requires callbacks not to throw (see Sink JSDoc in
+    // src/session/auto-reply/sink.ts). process.stdout.write can throw on
+    // EPIPE (downstream consumer closed the pipe), and JSON.stringify is
+    // safe today but defended against future shape changes. Swallow the
+    // failure so the auto-reply fiber's question.reject / permission.reply
+    // side effect still runs.
+    try {
+      process.stdout.write(JSON.stringify({ type, timestamp: Date.now(), sessionID: rootSessionID, ...data }) + "\n")
+    } catch {
+      // intentionally empty — see contract note above
+    }
+  }
+  return {
+    onAutoReject: (input) =>
+      emit("auto-reject", {
+        kind: input.kind,
+        autoRejectSessionID: input.sessionID,
+        totalAutoRejects: input.total,
+      }),
+    onAutoApprove: (input) =>
+      emit("auto-approve", {
+        kind: input.kind,
+        autoApproveSessionID: input.sessionID,
+        totalAutoApproves: input.total,
+      }),
+    // No JSON event for livelock warnings: the core already log.warn's at the
+    // same gate, and the operator-facing JSON contract historically (under the
+    // old RunEvents.emit) only emitted auto-reject/auto-approve. Keeping
+    // livelock log-only preserves that contract under F11 extraction.
+    onLivelockWarn: () => {},
+  }
+}
+
 export const RunCommand = cmd({
   command: "run [message..]",
   describe: "run opencode with a message",
@@ -372,14 +426,14 @@ export const RunCommand = cmd({
 
       if (baseID && args.fork) {
         const forked = await sdk.session.fork({ sessionID: baseID })
-        return forked.data?.id
+        return forked.data?.id ? SessionID.make(forked.data.id) : undefined
       }
 
-      if (baseID) return baseID
+      if (baseID) return SessionID.make(baseID)
 
       const name = title()
       const result = await sdk.session.create({ title: name, permission: rules })
-      return result.data?.id
+      return result.data?.id ? SessionID.make(result.data.id) : undefined
     }
 
     async function share(sdk: OpencodeClient, sessionID: string) {
@@ -397,7 +451,7 @@ export const RunCommand = cmd({
       }
     }
 
-    async function execute(sdk: OpencodeClient) {
+    async function execute(sdk: OpencodeClient, hasInProcessAutoReply: boolean) {
       function tool(part: ToolPart) {
         try {
           if (part.tool === "bash") return bash(props<typeof BashTool>(part))
@@ -533,16 +587,23 @@ export const RunCommand = cmd({
             if (permission.sessionID !== sessionID) continue
 
             if (args["dangerously-skip-permissions"]) {
-              await sdk.permission.reply({
-                requestID: permission.id,
-                reply: "once",
-              })
-            } else {
-              UI.println(
-                UI.Style.TEXT_WARNING_BOLD + "!",
-                UI.Style.TEXT_NORMAL +
-                  `permission requested: ${permission.permission} (${permission.patterns.join(", ")}); auto-rejecting`,
-              )
+              // In non-attach mode, in-process SessionAutoReply owns the
+              // reply contract — calling sdk.permission.reply here would
+              // race with it. Only the attach-mode SSE viewer must reply.
+              if (!hasInProcessAutoReply) {
+                await sdk.permission.reply({
+                  requestID: permission.id,
+                  reply: "once",
+                })
+              }
+              continue
+            }
+            UI.println(
+              UI.Style.TEXT_WARNING_BOLD + "!",
+              UI.Style.TEXT_NORMAL +
+                `permission requested: ${permission.permission} (${permission.patterns.join(", ")}); auto-rejecting`,
+            )
+            if (!hasInProcessAutoReply) {
               await sdk.permission.reply({
                 requestID: permission.id,
                 reply: "reject",
@@ -620,23 +681,39 @@ export const RunCommand = cmd({
         UI.error("Session not found")
         process.exit(1)
       }
-      await share(sdk, sessionID)
 
-      loop().catch((e) => {
-        console.error(e)
-        process.exit(1)
-      })
+      const runEventsHandle = hasInProcessAutoReply
+        ? await AppRuntime.runPromise(
+            SessionAutoReply.make(
+              {
+                rootSessionID: sessionID,
+                skipPermissions: args["dangerously-skip-permissions"] === true,
+              },
+              makeRunSink(args.format === "json", sessionID),
+            ),
+          )
+        : null
 
-      if (args.command) {
-        await sdk.session.command({
-          sessionID,
-          agent,
-          model: args.model,
-          command: args.command,
-          arguments: message,
-          variant: args.variant,
+      try {
+        await share(sdk, sessionID)
+
+        loop().catch((e) => {
+          console.error(e)
+          process.exit(1)
         })
-      } else {
+
+        if (args.command) {
+          await sdk.session.command({
+            sessionID,
+            agent,
+            model: args.model,
+            command: args.command,
+            arguments: message,
+            variant: args.variant,
+          })
+          return
+        }
+
         const model = args.model ? Provider.parseModel(args.model) : undefined
         await sdk.session.prompt({
           sessionID,
@@ -645,6 +722,8 @@ export const RunCommand = cmd({
           variant: args.variant,
           parts: [...files, { type: "text", text: message }],
         })
+      } finally {
+        runEventsHandle?.unsubscribe()
       }
     }
 
@@ -657,7 +736,7 @@ export const RunCommand = cmd({
         return { Authorization: auth }
       })()
       const sdk = createOpencodeClient({ baseUrl: args.attach, directory, headers })
-      return await execute(sdk)
+      return await execute(sdk, false)
     }
 
     await bootstrap(process.cwd(), async () => {
@@ -666,7 +745,7 @@ export const RunCommand = cmd({
         return Server.Default().app.fetch(request)
       }) as typeof globalThis.fetch
       const sdk = createOpencodeClient({ baseUrl: "http://opencode.internal", fetch: fetchFn })
-      await execute(sdk)
+      await execute(sdk, true)
     })
   },
 })
